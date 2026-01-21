@@ -1,0 +1,530 @@
+---
+title: "Getting Started with EmpiricalDynamics"
+author: "EmpiricalDynamics Package"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Getting Started with EmpiricalDynamics}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 5
+)
+```
+
+# Introduction
+
+The `EmpiricalDynamics` package provides a complete workflow for discovering 
+differential equations from time series data. This approach, sometimes called 
+"equation discovery" or "symbolic regression for dynamics," allows researchers 
+to uncover the mathematical laws governing observed phenomena.
+
+The package implements a six-step workflow:
+
+1. **Preprocessing**: Compute numerical derivatives from noisy time series
+2. **Exploration**: Visual analysis to identify functional relationships
+3. **Symbolic Search**: Discover equation structure automatically
+4. **Residual Analysis**: Construct stochastic differential equations (SDEs)
+5. **Validation**: Cross-validation, trajectory simulation, qualitative checks
+6. **Output**: Generate publication-ready reports and LaTeX equations
+
+# Installation
+
+```{r, eval=FALSE}
+# Install from local source
+install.packages("EmpiricalDynamics", repos = NULL, type = "source")
+
+# Or using devtools
+devtools::install_github("your-repo/EmpiricalDynamics")
+```
+
+# Quick Start Example
+
+Let's discover the equation governing logistic population growth.
+
+## Step 1: Load Data and Compute Derivatives
+
+```{r quickstart-prep, eval=FALSE}
+library(EmpiricalDynamics)
+
+# Load example data
+logistic_growth <- load_example_data("logistic_growth")
+
+# View the data
+head(logistic_growth)
+
+# Compute derivative using Total Variation Regularization (recommended)
+deriv <- compute_derivative(
+  logistic_growth$Z,
+  time = logistic_growth$time,
+  method = "tvr",
+  lambda = "auto"
+)
+
+# Add derivative to data
+logistic_growth$dZ <- deriv$derivative
+
+# Plot diagnostic
+plot(deriv)
+```
+
+## Step 2: Explore the Data
+
+```{r quickstart-explore, eval=FALSE}
+# Explore relationships between dZ/dt and Z
+exploration <- explore_dynamics(
+  data = logistic_growth,
+  response = "dZ",
+  predictors = "Z"
+)
+
+# View suggestions for functional forms
+print(exploration$suggestions)
+```
+
+## Step 3: Fit the Equation
+
+Based on theory, logistic growth follows: $\frac{dZ}{dt} = rZ(1 - Z/K)$
+
+```{r quickstart-fit, eval=FALSE}
+# Fit the theoretical equation
+equation <- fit_specified_equation(
+  "r * Z * (1 - Z / K)",
+  data = logistic_growth,
+  derivative_col = "dZ",
+  start = list(r = 0.5, K = 100)
+)
+
+# View results
+summary(equation)
+print(coef(equation))
+```
+
+## Step 4: Validate the Model
+
+```{r quickstart-validate, eval=FALSE}
+# Run comprehensive validation
+validation <- validate_model(
+  equation = equation,
+  data = logistic_growth,
+  derivative_col = "dZ",
+  variable = "Z",
+  cv_folds = 5
+)
+
+print(validation)
+```
+
+## Step 5: Generate Output
+
+```{r quickstart-output, eval=FALSE}
+# Get LaTeX equation
+latex_eq <- to_latex(equation, variable = "Z")
+cat(latex_eq)
+
+# Generate full report (using tempdir() per CRAN policy)
+generate_report(
+  results = list(
+    data = logistic_growth,
+    equation = equation,
+    validation = validation
+  ),
+  output_file = file.path(tempdir(), "logistic_analysis"),
+  format = "markdown"
+)
+```
+
+# Detailed Workflow
+
+## A. Numerical Differentiation
+
+Computing reliable derivatives from noisy data is critical. The package offers 
+several methods:
+
+### Total Variation Regularization (TVR)
+
+**Recommended for most applications**, especially economic data with trends 
+and structural breaks.
+
+```{r tvr-example, eval=FALSE}
+deriv_tvr <- compute_derivative(
+  y = data$Z,
+  time = data$time,
+  method = "tvr",
+  lambda = "auto"  # Automatic regularization selection
+)
+
+# Plot diagnostic: shows original, derivative, reconstruction, residuals
+plot_tvr_diagnostic(deriv_tvr)
+```
+
+TVR solves the optimization problem:
+$$\min_{\dot{Z}} \left\| Z - \int \dot{Z} \, dt \right\|_2^2 + \lambda \|\Delta \dot{Z}\|_1$$
+
+### Other Methods
+
+```{r other-methods, eval=FALSE}
+# Savitzky-Golay filter (preserves peaks, good for smooth data)
+deriv_sg <- compute_derivative(y, time, method = "savgol", 
+                                window = 11, order = 3)
+
+# Smoothing spline (good for high noise)
+deriv_spline <- compute_derivative(y, time, method = "spline", 
+                                    spar = 0.7)
+
+# Finite differences (simple, fast, sensitive to noise)
+deriv_fd <- compute_derivative(y, time, method = "fd")
+
+# Spectral (for periodic data ONLY - warns about Gibbs phenomenon otherwise)
+deriv_spec <- compute_derivative(y, time, method = "spectral")
+```
+
+### Automatic Method Selection
+
+```{r suggest-method, eval=FALSE}
+# Get recommendation based on data characteristics
+suggestion <- suggest_differentiation_method(data$Z, data$time)
+print(suggestion)
+
+# Compare all methods visually
+compare_differentiation_methods(data$Z, data$time)
+```
+
+## B. Visual Exploration
+
+Before formal fitting, explore the data visually:
+
+```{r exploration, eval=FALSE}
+# Comprehensive exploration
+exploration <- explore_dynamics(
+  data = data,
+  response = "dZ",
+  predictors = c("Z", "X", "Y")
+)
+
+# Individual plots
+plot_phase_1d(data, x = "Z", y = "dZ")
+plot_bivariate(data, x = "Z", y = "dZ")
+plot_surface_3d(data, x1 = "Z", x2 = "X", y = "dZ")
+```
+
+## C. Equation Discovery
+
+### Automated Symbolic Search
+
+```{r symbolic-search, eval=FALSE}
+# Genetic algorithm search (pure R)
+search_result <- symbolic_search(
+  data = data,
+  response = "dZ",
+  predictors = c("Z", "X"),
+  backend = "r_genetic",
+  max_complexity = 15,
+  n_generations = 50,
+  population_size = 100,
+  n_runs = 3
+)
+
+# View Pareto front
+plot_pareto_front(search_result)
+
+# Select best equation
+best_eq <- select_equation(search_result, criterion = "bic")
+```
+
+### Theory-Guided Fitting
+
+```{r theory-guided, eval=FALSE}
+# Fit a specific functional form
+equation <- fit_specified_equation(
+  "alpha + beta * Z + gamma * Z^2 + delta * X",
+  data = data,
+  derivative_col = "dZ",
+  method = "levenberg-marquardt"  # Robust optimization
+)
+
+summary(equation)
+```
+
+### Julia Backend (Optional)
+
+For large-scale symbolic regression, use the Julia backend:
+
+```{r julia-backend, eval=FALSE}
+# Setup Julia (one-time)
+setup_julia_backend()
+
+# Run with Julia's SymbolicRegression.jl
+search_result <- symbolic_search(
+  data = data,
+  response = "dZ",
+  predictors = c("Z", "X"),
+  backend = "julia",
+  max_complexity = 25
+)
+```
+
+## D. Residual Analysis and SDE Construction
+
+### Diagnostics
+
+```{r residual-diag, eval=FALSE}
+# Compute residuals
+resid <- compute_residuals(equation, data, "dZ")
+
+# Run diagnostic tests
+diag <- residual_diagnostics(resid, data)
+print(diag)
+plot(diag)
+```
+
+The diagnostics include:
+- **Ljung-Box test**: Autocorrelation in residuals
+- **ARCH-LM test**: Conditional heteroscedasticity
+- **Breusch-Pagan test**: Heteroscedasticity vs predictors
+- **Jarque-Bera test**: Normality
+- **Runs test**: Randomness
+
+### Modeling the Diffusion
+
+```{r diffusion, eval=FALSE}
+# Model conditional variance
+var_model <- model_conditional_variance(
+  resid,
+  data = data,
+  predictors = c("Z"),
+  method = "linear"  # or "quadratic", "symbolic"
+)
+
+# Construct SDE: dZ = f(Z,X) dt + g(Z) dW
+sde <- construct_sde(
+  drift = equation,
+  diffusion = var_model,
+  variable = "Z"
+)
+
+print(sde)
+```
+
+### Iterative GLS Estimation
+
+When heteroscedasticity is significant, use iterative GLS:
+
+```{r iterative-gls, eval=FALSE}
+# Iterative estimation for unbiased drift coefficients
+sde <- estimate_sde_iterative(
+  drift_formula = "a + b * Z + c * Z^2",
+  data = data,
+  derivative_col = "dZ",
+  diffusion_formula = "sigma * (1 + tau * abs(Z))",
+  max_iter = 20,
+  tolerance = 1e-4
+)
+
+# Check convergence
+print(sde$converged)
+print(sde$iterations)
+```
+
+## E. Validation
+
+### Cross-Validation
+
+```{r cv, eval=FALSE}
+# Block cross-validation (recommended for time series)
+cv <- cross_validate(
+  equation,
+  data = data,
+  derivative_col = "dZ",
+  k = 5,
+  method = "block"
+)
+
+print(cv)
+plot(cv)
+```
+
+### Trajectory Simulation
+
+```{r trajectory, eval=FALSE}
+# Simulate from the SDE
+sim <- simulate_trajectory(
+  sde,
+  initial_conditions = c(Z = data$Z[1]),
+  times = data$time,
+  n_sims = 100,
+  method = "euler"
+)
+
+# Plot with observed data
+plot(sim, observed_data = data)
+
+# Compare quantitatively
+metrics <- compare_trajectories(sim, data, "time", "Z")
+print(metrics)
+```
+
+### Qualitative Behavior
+
+```{r qualitative, eval=FALSE}
+# Analyze fixed points
+fps <- analyze_fixed_points(equation, "Z", range = c(-10, 150))
+print(fps)
+
+# Bifurcation analysis (vary a parameter)
+bifurc <- analyze_bifurcations(
+  equation, 
+  variable = "Z",
+  parameter = "K",
+  param_range = c(50, 200)
+)
+plot(bifurc)
+
+# Check against expected behavior
+qual_check <- check_qualitative_behavior(
+  equation, data, "Z",
+  expected_features = list(
+    n_fixed_points = 2,
+    stability_pattern = c("unstable", "stable"),
+    bounded = TRUE
+  )
+)
+print(qual_check)
+```
+
+### Comprehensive Validation
+
+```{r full-validation, eval=FALSE}
+validation <- validate_model(
+  equation = equation,
+  sde = sde,
+  data = data,
+  derivative_col = "dZ",
+  variable = "Z",
+  time_col = "time",
+  cv_folds = 5,
+  n_sims = 100,
+  expected_features = list(n_fixed_points = 2)
+)
+
+print(validation)
+plot(validation)
+```
+
+## F. Output and Reporting
+
+### LaTeX Equations
+
+```{r latex, eval=FALSE}
+# Convert to LaTeX
+latex <- to_latex(equation, variable = "Z", precision = 4)
+cat(latex)
+
+# Full SDE in LaTeX
+sde_latex <- to_latex(sde, variable = "Z")
+cat(sde_latex)
+```
+
+### Tables
+
+```{r tables, eval=FALSE}
+# Coefficient table
+coef_table <- coefficient_table(equation, format = "latex")
+cat(coef_table)
+
+# Model comparison
+models <- list(
+  "Linear" = fit_specified_equation("a + b*Z", data, "dZ"),
+  "Quadratic" = fit_specified_equation("a + b*Z + c*Z^2", data, "dZ"),
+  "Logistic" = fit_specified_equation("r*Z*(1-Z/K)", data, "dZ")
+)
+comparison <- model_comparison_table(models, data, "dZ", format = "markdown")
+cat(comparison)
+```
+
+### Full Report
+
+```{r report, eval=FALSE}
+# Collect all results
+results <- list(
+  data = data,
+  exploration = exploration,
+  equation = equation,
+  sde = sde,
+  validation = validation
+)
+
+# Generate markdown report (using tempdir() per CRAN policy)
+generate_report(
+  results,
+  output_file = file.path(tempdir(), "analysis_report"),
+  format = "markdown",
+  title = "My Dynamics Analysis"
+)
+
+# Export to multiple formats (using tempdir() per CRAN policy)
+export_results(results, output_dir = tempdir(), formats = c("rds", "csv", "json"))
+
+# Save plots (using tempdir() per CRAN policy)
+save_plots(results, output_dir = tempdir(), format = c("png", "pdf"))
+```
+
+### Analysis Summary
+
+```{r summary, eval=FALSE}
+# Print summary to console
+print_summary(results)
+
+# Get template for new analyses (using tempdir() per CRAN policy)
+get_analysis_template(file.path(tempdir(), "my_analysis.R"))
+```
+
+# Best Practices
+
+## Differentiation
+
+1. **Start with TVR** for economic/social science data
+2. Use `suggest_differentiation_method()` for guidance
+3. Always plot diagnostics to verify derivative quality
+4. Consider data collection frequency via `diagnose_sampling_frequency()`
+
+## Equation Discovery
+
+1. **Use theory when available** - `fit_specified_equation()` is more reliable
+2. For exploratory analysis, use symbolic search but validate thoroughly
+3. Prefer simpler equations (parsimony)
+4. Run multiple searches and compare
+
+## Validation
+
+1. **Always use block CV** for time series (not random CV)
+2. Check residual diagnostics before trusting results
+3. Verify qualitative behavior matches domain knowledge
+4. Use bootstrap for uncertainty quantification
+
+## Reporting
+
+1. Report uncertainty (standard errors or confidence intervals)
+2. Include model comparison with alternatives
+3. Show validation metrics prominently
+4. Discuss limitations and assumptions
+
+# Further Reading
+
+- Brunton, S. L., & Kutz, J. N. (2019). *Data-Driven Science and Engineering*
+- Schmidt, M., & Lipson, H. (2009). Distilling free-form natural laws from 
+  experimental data. *Science*, 324(5923), 81-85.
+- Chartrand, R. (2011). Numerical differentiation of noisy, nonsmooth data. 
+  *ISRN Applied Mathematics*, 2011.
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
