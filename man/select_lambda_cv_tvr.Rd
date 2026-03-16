@@ -9,7 +9,7 @@ select_lambda_cv_tvr(
   t,
   A = NULL,
   D = NULL,
-  solver = "osqp",
+  solver = "clarabel",
   lambda_seq = 10^seq(-4, 2, length.out = 30),
   verbose = FALSE
 )
@@ -23,7 +23,8 @@ select_lambda_cv_tvr(
 
 \item{D}{Difference matrix.}
 
-\item{solver}{Optimization backend.}
+\item{solver}{Preferred solver (default "clarabel"). Falls back to other
+solvers if the preferred one fails.}
 
 \item{lambda_seq}{Sequence of lambda values to evaluate.}
 
@@ -34,5 +35,6 @@ Selected lambda value.
 }
 \description{
 Selects the regularization parameter lambda using leave-one-out-like
-cross-validation.
+cross-validation. Problems are internally rescaled for numerical stability,
+and a solver chain is used for each candidate lambda.
 }

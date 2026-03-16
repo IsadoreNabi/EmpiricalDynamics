@@ -556,6 +556,125 @@ predict.variance_model <- function(object, newdata, ...) {
 }
 
 
+#' Estimate Diffusion via Quadratic Variation
+#'
+#' Estimates the diffusion coefficient g(.) of an SDE directly from the
+#' quadratic variation of increments, without relying on derivative residuals.
+#' For an SDE dZ = f dt + g dW, the realized quadratic variation satisfies
+#' \eqn{E[(\Delta Z)^2 / \Delta t] = g^2 + O(\Delta t)}, providing a
+#' model-free estimator of \eqn{g^2}.
+#'
+#' @details
+#' This method is recommended over residual-based diffusion estimation when TVR
+#' is used to compute derivatives. TVR smooths out high-frequency components that
+#' carry the diffusion signature, making residual-based estimation unreliable.
+#' Quadratic variation bypasses this by working directly with the raw increments.
+#'
+#' The raw per-step estimates \eqn{(\Delta Z)^2 / \Delta t} are noisy (each is
+#' a single chi-squared realization), so a rolling median is applied before
+#' fitting.
+#'
+#' @param Z Numeric vector of the state variable.
+#' @param t Numeric vector of time points.
+#' @param predictors Character vector of predictor names or data frame.
+#' @param data Data frame containing the predictors (required if predictors
+#'   is a character vector).
+#' @param method Modeling method for g^2: "linear", "quadratic", "gam",
+#'   or "constant".
+#' @param smooth_window Size of the rolling median window for smoothing
+#'   raw quadratic variation (must be odd, default 21).
+#'
+#' @return An object of class "variance_model" compatible with the SDE pipeline.
+#'
+#' @export
+estimate_diffusion_qv <- function(Z, t, predictors, data = NULL,
+                                  method = c("linear", "quadratic",
+                                             "gam", "constant"),
+                                  smooth_window = 21L) {
+
+  method <- match.arg(method)
+
+  n <- length(Z)
+  dZ <- diff(Z)
+  dt_vec <- diff(t)
+
+  # Realized quadratic variation: (DeltaZ)^2 / dt estimates g^2
+  qv_raw <- dZ^2 / dt_vec
+
+  # Rolling median to smooth chi-squared noise
+  if (smooth_window < 3L) smooth_window <- 3L
+  if (smooth_window %% 2L == 0L) smooth_window <- smooth_window + 1L
+  half_w <- smooth_window %/% 2L
+
+  qv_smooth <- vapply(seq_along(qv_raw), function(i) {
+    lo <- max(1L, i - half_w)
+    hi <- min(length(qv_raw), i + half_w)
+    stats::median(qv_raw[lo:hi])
+  }, numeric(1))
+
+  # Take sqrt to get g (diffusion coefficient, not variance)
+  g_smooth <- sqrt(pmax(qv_smooth, 0))
+
+  # Align to length n: pad last value (diff loses one element)
+  g_smooth <- c(g_smooth, g_smooth[length(g_smooth)])
+
+  # Prepare predictor data
+  if (is.character(predictors)) {
+    if (is.null(data)) {
+      stop("'data' required when 'predictors' is a character vector", call. = FALSE)
+    }
+    pred_vars <- predictors
+    pred_data <- data[, pred_vars, drop = FALSE]
+  } else {
+    pred_data <- as.data.frame(predictors)
+    pred_vars <- names(pred_data)
+  }
+
+  # Fit model: g ~ predictors
+  fit <- switch(method,
+    "constant" = {
+      lm_data <- data.frame(.diffusion = g_smooth)
+      stats::lm(.diffusion ~ 1, data = lm_data)
+    },
+    "linear" = {
+      lm_data <- cbind(pred_data, .diffusion = g_smooth)
+      stats::lm(.diffusion ~ ., data = lm_data)
+    },
+    "quadratic" = {
+      pd2 <- pred_data
+      for (v in pred_vars) {
+        pd2[[paste0(v, "_sq")]] <- pd2[[v]]^2
+      }
+      lm_data <- cbind(pd2, .diffusion = g_smooth)
+      stats::lm(.diffusion ~ ., data = lm_data)
+    },
+    "gam" = {
+      if (ncol(pred_data) == 1) {
+        stats::loess(g_smooth ~ pred_data[[1]], span = 0.5)
+      } else {
+        lm_data <- cbind(pred_data, .diffusion = g_smooth)
+        stats::lm(.diffusion ~ ., data = lm_data)
+      }
+    }
+  )
+
+  result <- list(
+    fit = fit,
+    method = method,
+    transform = "absolute",
+    predictors = pred_vars,
+    target_transform = "absolute",
+    estimation = "quadratic_variation",
+    smooth_window = smooth_window,
+    qv_raw = qv_raw,
+    qv_smooth = g_smooth
+  )
+
+  class(result) <- "variance_model"
+  result
+}
+
+
 #' Construct Stochastic Differential Equation Model
 #'
 #' Combines a drift equation and diffusion model into a complete SDE:
@@ -636,14 +755,28 @@ construct_sde <- function(drift, diffusion = NULL,
 #' @param initial_drift Initial drift equation (optional)
 #' @param max_iter Maximum number of iterations
 #' @param tol Convergence tolerance (RMSE change in coefficients)
+#' @param diffusion_method Method for estimating the final diffusion coefficient:
+#'   "quadratic_variation" (default) estimates g(.) directly from increments
+#'   (DeltaZ)^2/dt, which is robust when TVR is used for derivatives.
+#'   "residual" uses the classical residual-based approach via
+#'   \code{\link{model_conditional_variance}}.
+#' @param Z Numeric vector of the state variable (required when
+#'   diffusion_method = "quadratic_variation").
+#' @param t Numeric vector of time points (required when
+#'   diffusion_method = "quadratic_variation").
 #'
 #' @return An sde_model object with refined estimates
 #'
 #' @export
 estimate_sde_iterative <- function(target, predictors, data,
                                    initial_drift = NULL,
-                                   max_iter = 10, tol = 1e-4) {
-  
+                                   max_iter = 10, tol = 1e-4,
+                                   diffusion_method = c("quadratic_variation",
+                                                        "residual"),
+                                   Z = NULL, t = NULL) {
+
+  diffusion_method <- match.arg(diffusion_method)
+
   n <- length(target)
   
   # Step 0: Initial drift estimate
@@ -672,8 +805,9 @@ estimate_sde_iterative <- function(target, predictors, data,
   for (i in 1:max_iter) {
     message(sprintf("\n--- Iteration %d ---", i))
     
-    # Step i.a: Estimate diffusion
-    message("  Estimating diffusion g...")
+    # Step i.a: Estimate diffusion for GLS weights (always residual-based
+    # within the loop, since weights only need relative scale)
+    message("  Estimating diffusion g (for GLS weights)...")
     g_current <- model_conditional_variance(
       residuals = eps_current,
       predictors = predictors,
@@ -723,12 +857,31 @@ estimate_sde_iterative <- function(target, predictors, data,
       warning("Maximum iterations reached without convergence.")
     }
   }
+
+  # Final diffusion estimate
+  if (diffusion_method == "quadratic_variation") {
+    if (is.null(Z) || is.null(t)) {
+      message(paste0(
+        "  Z and t not provided for quadratic variation; ",
+        "falling back to residual-based diffusion."
+      ))
+    } else {
+      message("  Estimating final diffusion via quadratic variation...")
+      g_current <- estimate_diffusion_qv(
+        Z = Z, t = t,
+        predictors = predictors,
+        data = data,
+        method = "linear"
+      )
+    }
+  }
   
   # Construct final SDE
   sde <- list(
     drift = f_current,
     diffusion = g_current,
     estimation_method = "iterative_gls",
+    diffusion_method = diffusion_method,
     n_iterations = i,
     converged = (i < max_iter),
     final_weights = weights,
@@ -949,6 +1102,9 @@ print.sde_model <- function(x, ...) {
   if (!is.null(x$diffusion)) {
     cat("Diffusion: + g(Z, X, ...) dW\n")
     cat("  Method:", x$diffusion$method, "\n")
+    if (!is.null(x$diffusion$estimation)) {
+      cat("  Estimation:", x$diffusion$estimation, "\n")
+    }
     cat("  Transform:", x$diffusion$transform, "\n\n")
   }
   

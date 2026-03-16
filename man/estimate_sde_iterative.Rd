@@ -10,7 +10,10 @@ estimate_sde_iterative(
   data,
   initial_drift = NULL,
   max_iter = 10,
-  tol = 1e-04
+  tol = 1e-04,
+  diffusion_method = c("quadratic_variation", "residual"),
+  Z = NULL,
+  t = NULL
 )
 }
 \arguments{
@@ -25,6 +28,18 @@ estimate_sde_iterative(
 \item{max_iter}{Maximum number of iterations}
 
 \item{tol}{Convergence tolerance (RMSE change in coefficients)}
+
+\item{diffusion_method}{Method for estimating the final diffusion coefficient:
+"quadratic_variation" (default) estimates g(.) directly from increments
+(DeltaZ)^2/dt, which is robust when TVR is used for derivatives.
+"residual" uses the classical residual-based approach via
+\code{\link{model_conditional_variance}}.}
+
+\item{Z}{Numeric vector of the state variable (required when
+diffusion_method = "quadratic_variation").}
+
+\item{t}{Numeric vector of time points (required when
+diffusion_method = "quadratic_variation").}
 }
 \value{
 An sde_model object with refined estimates

@@ -1,7 +1,7 @@
 Package: EmpiricalDynamics
 Title: Empirical Discovery of Differential Equations from Time Series
         Data
-Version: 0.1.2
+Version: 0.1.3
 Authors@R: 
     person("José Mauricio", "Gómez Julián", email = "isadore.nabi@pm.me", role = c("aut", "cre"),
            comment = c(ORCID = "0009-0000-2412-3150"))
@@ -20,12 +20,13 @@ Roxygen: list(markdown = TRUE)
 RoxygenNote: 7.3.3
 SystemRequirements: Julia (>= 1.6)
 Depends: R (>= 4.0.0)
-Imports: JuliaCall (>= 0.17), CVXR (>= 1.0), minpack.lm (>= 1.2),
+Imports: JuliaCall (>= 0.17), CVXR (>= 1.8), minpack.lm (>= 1.2),
         signal (>= 0.7), lmtest (>= 0.9), tseries (>= 0.10), ggplot2
         (>= 3.4.0), gridExtra (>= 2.3), stats, graphics, grDevices,
         utils, methods
-Suggests: osqp (>= 0.6), ECOSolveR (>= 0.5), testthat (>= 3.0.0), knitr
-        (>= 1.40), rmarkdown (>= 2.20), covr, mgcv
+Suggests: clarabel, scs, osqp (>= 1.0), ECOSolveR (>= 0.5),
+        testthat (>= 3.0.0), knitr (>= 1.40), rmarkdown (>= 2.20),
+        covr, mgcv
 Config/testthat/edition: 3
 VignetteBuilder: knitr
 URL: https://github.com/IsadoreNabi/EmpiricalDynamics

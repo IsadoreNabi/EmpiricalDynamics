@@ -4,7 +4,7 @@
 \alias{compute_derivative_tvr}
 \title{Total Variation Regularized Differentiation}
 \usage{
-compute_derivative_tvr(Z, t = NULL, lambda = "auto", solver = "osqp", ...)
+compute_derivative_tvr(Z, t = NULL, lambda = "auto", solver = "clarabel", ...)
 }
 \arguments{
 \item{Z}{Numeric vector of observations.}
@@ -13,7 +13,9 @@ compute_derivative_tvr(Z, t = NULL, lambda = "auto", solver = "osqp", ...)
 
 \item{lambda}{Regularization parameter ("auto" for cross-validation selection).}
 
-\item{solver}{Optimization backend: "osqp", "ecos", or "scs".}
+\item{solver}{Preferred solver: "clarabel" (default, interior point),
+"scs" (conic ADMM), or "osqp" (QP ADMM). If the preferred solver fails or
+returns an inaccurate solution, other solvers are tried automatically.}
 
 \item{...}{Additional arguments (ignored).}
 }
@@ -22,5 +24,28 @@ Object of class "tvr_derivative" (also a list with $derivative).
 }
 \description{
 Computes derivatives by solving a convex optimization problem that balances
-fidelity to the data against smoothness of the derivative.
+fidelity to the data against smoothness of the derivative. The problem is
+internally rescaled for numerical stability, and a cascading solver chain
+is used for maximum robustness.
+}
+\details{
+\strong{Solver status interpretation:}
+\itemize{
+\item \code{"optimal"}: The solver converged within its tolerances.
+Results are reliable.
+\item \code{"optimal_inaccurate"}: The solver found a solution but did not
+meet strict tolerance criteria. For TVR this rarely affects derivative
+quality in a perceptible way, because internal rescaling keeps the
+problem well-conditioned. If degradation is observed, try a different
+preferred solver or adjust lambda manually.
+}
+
+\strong{TVR and stochastic differential equations:}
+TVR penalizes total variation of the derivative, which effectively smooths
+out high-frequency components. In SDEs, the diffusion signature lives in
+those high-frequency residuals. As a consequence, the better TVR estimates
+the drift, the more it removes the information needed to recover the
+diffusion coefficient from residuals. For SDE applications, consider using
+\code{\link{estimate_diffusion_qv}} (quadratic variation) to estimate
+diffusion directly from increments rather than from TVR residuals.
 }

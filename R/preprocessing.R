@@ -210,97 +210,168 @@ compute_derivative <- function(Z, t = NULL,
 #' Total Variation Regularized Differentiation
 #'
 #' Computes derivatives by solving a convex optimization problem that balances
-#' fidelity to the data against smoothness of the derivative.
+#' fidelity to the data against smoothness of the derivative. The problem is
+#' internally rescaled for numerical stability, and a cascading solver chain
+#' is used for maximum robustness.
+#'
+#' @details
+#' \strong{Solver status interpretation:}
+#' \itemize{
+#'   \item \code{"optimal"}: The solver converged within its tolerances.
+#'     Results are reliable.
+#'   \item \code{"optimal_inaccurate"}: The solver found a solution but did not
+#'     meet strict tolerance criteria. For TVR this rarely affects derivative
+#'     quality in a perceptible way, because internal rescaling keeps the
+#'     problem well-conditioned. If degradation is observed, try a different
+#'     preferred solver or adjust lambda manually.
+#' }
+#'
+#' \strong{TVR and stochastic differential equations:}
+#' TVR penalizes total variation of the derivative, which effectively smooths
+#' out high-frequency components. In SDEs, the diffusion signature lives in
+#' those high-frequency residuals. As a consequence, the better TVR estimates
+#' the drift, the more it removes the information needed to recover the
+#' diffusion coefficient from residuals. For SDE applications, consider using
+#' \code{\link{estimate_diffusion_qv}} (quadratic variation) to estimate
+#' diffusion directly from increments rather than from TVR residuals.
 #'
 #' @param Z Numeric vector of observations.
 #' @param t Numeric vector of time points (NULL assumes dt=1).
 #' @param lambda Regularization parameter ("auto" for cross-validation selection).
-#' @param solver Optimization backend: "osqp", "ecos", or "scs".
+#' @param solver Preferred solver: "clarabel" (default, interior point),
+#'   "scs" (conic ADMM), or "osqp" (QP ADMM). If the preferred solver fails or
+#'   returns an inaccurate solution, other solvers are tried automatically.
 #' @param ... Additional arguments (ignored).
 #'
 #' @return Object of class "tvr_derivative" (also a list with $derivative).
 #'
 #' @export
-compute_derivative_tvr <- function(Z, t = NULL, lambda = "auto", 
-                                   solver = "osqp", ...) {
-  
+compute_derivative_tvr <- function(Z, t = NULL, lambda = "auto",
+                                   solver = "clarabel", ...) {
+
   if (!requireNamespace("CVXR", quietly = TRUE)) {
     stop("Package 'CVXR' is required for TVR differentiation. Please install it.")
   }
-  
+
   n <- length(Z)
   if (is.null(t)) t <- 1:n
   dt <- diff(t)
-  
+
   if (!exists("build_integration_matrix", mode = "function")) {
     stop("Internal function 'build_integration_matrix' not found.")
   }
-  
+
   A <- build_integration_matrix(n, dt)
   D <- build_difference_matrix(n)
-  
-  # Define optimization problem
-  dZ <- CVXR::Variable(n)
   Z_centered <- Z - Z[1]
-  
-  fidelity <- CVXR::sum_squares(Z_centered - A %*% dZ)
-  total_variation <- CVXR::norm1(D %*% dZ)
-  
-  # Auto-select lambda if requested
+
+  # Layer 1: Rescale for numerical stability
+  # Brings all values to O(1) so solver tolerances are well-calibrated
+  s_Z <- max(stats::sd(Z_centered), .Machine$double.eps)
+  Z_scaled <- Z_centered / s_Z
+
   if (identical(lambda, "auto")) {
     lambda <- select_lambda_cv_tvr(Z, t, A, D, solver)
     message(sprintf("Lambda selected automatically: %.4e", lambda))
   }
-  
-  # Solve optimization problem
-  objective <- CVXR::Minimize(fidelity + lambda * total_variation)
+
+  # Adjusted lambda for the rescaled problem (algebraically equivalent)
+  lambda_scaled <- lambda / s_Z
+
+  # Build optimization on rescaled variables: u = dZ / s_Z
+  u <- CVXR::Variable(n)
+  fidelity <- CVXR::sum_squares(Z_scaled - A %*% u)
+  total_variation <- CVXR::norm1(D %*% u)
+  objective <- CVXR::Minimize(fidelity + lambda_scaled * total_variation)
   problem <- CVXR::Problem(objective)
-  
-  result <- tryCatch(
-    CVXR::solve(problem, solver = toupper(solver)),
-    error = function(e) {
-      # Try alternative solver
-      message("Primary solver failed, trying SCS...")
-      tryCatch(
-        CVXR::solve(problem, solver = "SCS"),
-        error = function(e2) list(status = "error")
-      )
+
+  # Layers 2-4: Cascading solver chain with diverse algorithms
+  # CLARABEL (interior point) -> SCS (conic ADMM) -> OSQP (QP ADMM)
+  solver_chain <- unique(c(toupper(solver), "CLARABEL", "SCS", "OSQP"))
+  solve_status <- "error"
+  solver_used <- "none"
+  best_u_values <- NULL
+
+  for (s in solver_chain) {
+    # Suppress warnings from intermediate attempts that we may discard
+    psolve_ok <- tryCatch(
+      suppressWarnings(CVXR::psolve(problem, solver = s)),
+      error = function(e) NULL
+    )
+
+    if (is.null(psolve_ok)) next
+
+    current_status <- tryCatch(
+      CVXR::status(problem),
+      error = function(e) "error"
+    )
+
+    if (current_status == "optimal") {
+      solve_status <- "optimal"
+      solver_used <- s
+      best_u_values <- as.vector(CVXR::value(u))
+      break
     }
-  )
-  
-  if (is.null(result$status) || !result$status %in% c("optimal", "optimal_inaccurate")) {
-    warning(paste("Solver did not reach optimum. Status:", result$status))
+
+    if (current_status == "optimal_inaccurate" && is.null(best_u_values)) {
+      solve_status <- "optimal_inaccurate"
+      solver_used <- s
+      best_u_values <- as.vector(CVXR::value(u))
+    }
   }
-  
-  dZ_hat <- as.vector(result$getValue(dZ))
-  
-  # Compute reconstruction for diagnostics
+
+  # Layer 5: Handle failures
+  if (is.null(best_u_values)) {
+    stop(
+      "TVR optimization failed: all solvers returned errors. ",
+      "Consider using method = 'savgol' as an alternative."
+    )
+  }
+
+  if (solve_status == "optimal_inaccurate") {
+    warning(sprintf(
+      paste0(
+        "Best available solution has status 'optimal_inaccurate' (solver: %s). ",
+        "This typically indicates minor numerical imprecision that does not ",
+        "significantly affect derivative estimates. If results seem degraded, ",
+        "try adjusting lambda manually or using method = 'savgol'."
+      ),
+      solver_used
+    ))
+  }
+
+  # Recover original scale: dZ = u * s_Z
+  dZ_hat <- best_u_values * s_Z
+
+  # Compute diagnostics from raw values (solver-state independent)
   Z_reconstructed <- Z[1] + c(0, cumsum(dZ_hat[-n] * dt))
   reconstruction_error <- sqrt(mean((Z - Z_reconstructed)^2))
-  
-  # Return with attributes
+  fidelity_val <- sum((Z_centered - as.vector(A %*% dZ_hat))^2)
+  tv_val <- sum(abs(diff(dZ_hat)))
+
   out <- structure(
     dZ_hat,
     lambda = lambda,
-    solver_status = result$status,
-    fidelity_term = as.numeric(result$getValue(fidelity)),
-    tv_term = as.numeric(result$getValue(total_variation)),
+    solver_status = solve_status,
+    solver_used = solver_used,
+    fidelity_term = fidelity_val,
+    tv_term = tv_val,
     reconstruction_rmse = reconstruction_error,
     Z_reconstructed = Z_reconstructed,
     class = c("tvr_derivative", "numeric")
   )
-  
-  # Also return as list for compatibility, AND assign S3 class to list for tests
+
   res_list <- list(
     derivative = as.numeric(out),
     lambda = lambda,
-    solver_status = result$status,
+    solver_status = solve_status,
+    solver_used = solver_used,
     reconstruction_rmse = reconstruction_error,
     Z_reconstructed = Z_reconstructed,
     raw = out
   )
   class(res_list) <- c("tvr_derivative", "list")
-  
+
   res_list
 }
 
@@ -308,70 +379,119 @@ compute_derivative_tvr <- function(Z, t = NULL, lambda = "auto",
 #' Cross-Validation Selection of Lambda for TVR
 #'
 #' Selects the regularization parameter lambda using leave-one-out-like
-#' cross-validation.
+#' cross-validation. Problems are internally rescaled for numerical stability,
+#' and a solver chain is used for each candidate lambda.
 #'
 #' @param Z Numeric vector of observations.
 #' @param t Numeric vector of time points.
 #' @param A Integration matrix.
 #' @param D Difference matrix.
-#' @param solver Optimization backend.
+#' @param solver Preferred solver (default "clarabel"). Falls back to other
+#'   solvers if the preferred one fails.
 #' @param lambda_seq Sequence of lambda values to evaluate.
 #' @param verbose Print progress?
 #'
 #' @return Selected lambda value.
 #'
 #' @export
-select_lambda_cv_tvr <- function(Z, t, A = NULL, D = NULL, solver = "osqp",
+select_lambda_cv_tvr <- function(Z, t, A = NULL, D = NULL, solver = "clarabel",
                                  lambda_seq = 10^seq(-4, 2, length.out = 30),
                                  verbose = FALSE) {
-  
+
   if (!requireNamespace("CVXR", quietly = TRUE)) {
     stop("CVXR required")
   }
-  
+
   n <- length(Z)
   dt <- diff(t)
   Z_centered <- Z - Z[1]
-  
+
   if (is.null(A)) A <- build_integration_matrix(n, dt)
   if (is.null(D)) D <- build_difference_matrix(n)
-  
+
+  # Rescale for numerical stability (same as compute_derivative_tvr)
+  s_Z <- max(stats::sd(Z_centered), .Machine$double.eps)
+  Z_scaled <- Z_centered / s_Z
+
+  # Solver chain for CV subproblems
+  cv_solver_chain <- unique(c(toupper(solver), "CLARABEL", "SCS"))
+
+  # Counters for consolidated status message
+  n_optimal <- 0L
+  n_inaccurate <- 0L
+  n_failed <- 0L
+
   cv_errors <- sapply(lambda_seq, function(lam) {
     if (verbose) cat(".")
-    
-    dZ <- CVXR::Variable(n)
-    fidelity <- CVXR::sum_squares(Z_centered - A %*% dZ)
-    tv <- CVXR::norm1(D %*% dZ)
-    prob <- CVXR::Problem(CVXR::Minimize(fidelity + lam * tv))
-    
-    res <- tryCatch(
-      CVXR::solve(prob, solver = toupper(solver)),
-      error = function(e) list(status = "error")
-    )
-    
-    if (!is.null(res$status) && res$status %in% c("optimal", "optimal_inaccurate")) {
-      dZ_hat <- as.vector(res$getValue(dZ))
-      Z_reconstructed <- Z[1] + c(0, cumsum(dZ_hat[-n] * dt))
-      mean((Z - Z_reconstructed)^2)
-    } else {
-      Inf
+
+    lambda_scaled <- lam / s_Z
+
+    u <- CVXR::Variable(n)
+    fid <- CVXR::sum_squares(Z_scaled - A %*% u)
+    tv <- CVXR::norm1(D %*% u)
+    prob <- CVXR::Problem(CVXR::Minimize(fid + lambda_scaled * tv))
+
+    u_values <- NULL
+    best_status <- "failed"
+    for (s in cv_solver_chain) {
+      psolve_ok <- tryCatch(
+        suppressWarnings(CVXR::psolve(prob, solver = s)),
+        error = function(e) NULL
+      )
+
+      if (is.null(psolve_ok)) next
+
+      prob_status <- tryCatch(
+        CVXR::status(prob),
+        error = function(e) "error"
+      )
+
+      if (prob_status == "optimal") {
+        u_values <- as.vector(CVXR::value(u))
+        best_status <- "optimal"
+        break
+      }
+
+      if (prob_status == "optimal_inaccurate" && is.null(u_values)) {
+        u_values <- as.vector(CVXR::value(u))
+        best_status <- "optimal_inaccurate"
+      }
     }
+
+    # Update counters in parent environment
+    if (best_status == "optimal") {
+      n_optimal <<- n_optimal + 1L
+    } else if (best_status == "optimal_inaccurate") {
+      n_inaccurate <<- n_inaccurate + 1L
+    } else {
+      n_failed <<- n_failed + 1L
+    }
+
+    if (is.null(u_values)) return(Inf)
+
+    dZ_hat <- u_values * s_Z
+    Z_reconstructed <- Z[1] + c(0, cumsum(dZ_hat[-n] * dt))
+    mean((Z - Z_reconstructed)^2)
   })
-  
+
   if (verbose) cat("\n")
-  
-  # One-standard-error rule
+
+  n_total <- length(lambda_seq)
+  message(sprintf(
+    "Lambda CV: %d/%d optimal, %d/%d inaccurate, %d/%d failed",
+    n_optimal, n_total, n_inaccurate, n_total, n_failed, n_total
+  ))
+
   valid_idx <- is.finite(cv_errors)
   if (sum(valid_idx) < 3) {
     warning("Few valid lambdas. Using minimum directly.")
     return(lambda_seq[which.min(cv_errors)])
   }
-  
+
   min_idx <- which.min(cv_errors)
   se <- stats::sd(cv_errors[valid_idx]) / sqrt(sum(valid_idx))
   threshold <- cv_errors[min_idx] + se
-  
-  # Largest lambda within threshold (more regularization = simpler model)
+
   candidates <- which(cv_errors <= threshold & seq_along(cv_errors) >= min_idx)
   lambda_seq[max(candidates)]
 }
@@ -782,6 +902,9 @@ print.tvr_derivative <- function(x, ...) {
   cat(sprintf("  Length: %d\n", length(x$derivative)))
   cat(sprintf("  Lambda: %.4e\n", x$lambda))
   cat(sprintf("  Solver status: %s\n", x$solver_status))
+  if (!is.null(x$solver_used)) {
+    cat(sprintf("  Solver used: %s\n", x$solver_used))
+  }
   cat(sprintf("  Reconstruction RMSE: %.6f\n", x$reconstruction_rmse))
   cat(sprintf("  Range: [%.4f, %.4f]\n", min(x$derivative), max(x$derivative)))
   invisible(x)
