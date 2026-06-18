@@ -574,82 +574,338 @@ symbolic_search_r_exhaustive <- function(target, predictors, operators,
 #' Julia Backend for Symbolic Search
 #'
 #' Uses SymbolicRegression.jl for advanced symbolic regression.
+#' Connects via JuliaConnectoR (TCP-based, robust on Windows).
+#' Falls back to JuliaCall if JuliaConnectoR is not available.
 #'
 #' @keywords internal
 symbolic_search_julia <- function(target, predictors, operators, constraints,
                                   n_runs, complexity_penalty, parsimony_pressure,
                                   julia_options, weights, verbose) {
-  
-  if (!requireNamespace("JuliaCall", quietly = TRUE)) {
-    warning("JuliaCall not available. Falling back to R backend.")
+
+  use_connector <- requireNamespace("JuliaConnectoR", quietly = TRUE)
+  use_juliacall <- requireNamespace("JuliaCall", quietly = TRUE)
+
+  if (!use_connector && !use_juliacall) {
+    warning("Neither JuliaConnectoR nor JuliaCall available. Falling back to R backend.")
     return(symbolic_search_r_genetic(target, predictors, operators, constraints,
                                      n_runs, complexity_penalty, parsimony_pressure,
                                      weights, verbose))
   }
-  
-  # Initialize Julia
-  tryCatch({
-    JuliaCall::julia_setup()
-    JuliaCall::julia_library("SymbolicRegression")
+
+  # Prefer JuliaConnectoR (TCP-based, avoids embedding segfaults on Windows)
+  if (use_connector) {
+    return(symbolic_search_julia_connector(target, predictors, operators, constraints,
+                                           n_runs, complexity_penalty, parsimony_pressure,
+                                           julia_options, weights, verbose))
+  }
+
+  # Fallback: JuliaCall
+  return(symbolic_search_juliacall(target, predictors, operators, constraints,
+                                    n_runs, complexity_penalty, parsimony_pressure,
+                                    julia_options, weights, verbose))
+}
+
+
+#' Julia Backend via JuliaConnectoR (TCP-based)
+#' @keywords internal
+symbolic_search_julia_connector <- function(target, predictors, operators, constraints,
+                                             n_runs, complexity_penalty, parsimony_pressure,
+                                             julia_options, weights, verbose) {
+
+  julia_ready <- tryCatch({
+    JuliaConnectoR::juliaEval("import Pkg; Pkg.activate(); using SymbolicRegression; using DynamicExpressions; true")
   }, error = function(e) {
-    warning("Julia setup failed: ", e$message, "\nFalling back to R backend.")
+    warning("Julia setup via JuliaConnectoR failed: ", e$message,
+            "\nFalling back to R backend.")
+    FALSE
+  })
+
+  if (!isTRUE(julia_ready)) {
     return(symbolic_search_r_genetic(target, predictors, operators, constraints,
                                      n_runs, complexity_penalty, parsimony_pressure,
                                      weights, verbose))
-  })
-  
-  # Transfer data to Julia
+  }
+
+  # Source the robust Julia backend shipped with the package
+  backend_path <- system.file("julia", "symbolic_backend.jl",
+                              package = "EmpiricalDynamics")
+  if (nzchar(backend_path)) {
+    tryCatch(
+      JuliaConnectoR::juliaEval(sprintf('include("%s")',
+                                         gsub("\\\\", "/", backend_path))),
+      error = function(e) {
+        if (verbose) message("Note: could not source Julia backend: ", e$message)
+      }
+    )
+  }
+
+  # Prepare data
   X <- as.matrix(predictors)
   y <- as.numeric(target)
-  
-  JuliaCall::julia_assign("X", t(X))  # Julia uses column-major
-  JuliaCall::julia_assign("y", y)
-  
-  # Build options
-  options_code <- sprintf("
-    options = SymbolicRegression.Options(
-        binary_operators = [+, -, *, /],
-        unary_operators = [inv, square, sqrt, log, exp],
-        complexity_of_operators = Dict(inv => 1, square => 1),
-        parsimony = %f,
-        maxsize = %d,
-        niterations = %d
-    )
-  ", complexity_penalty, constraints$max_complexity %||% 30, n_runs * 100)
-  
-  JuliaCall::julia_command(options_code)
-  
-  # Run symbolic regression
-  JuliaCall::julia_command("
-    hall_of_fame = EquationSearch(X, y; options=options, niterations=100)
-  ")
-  
-  # Extract results
-  results <- JuliaCall::julia_eval("
-    [(string(member.tree), member.loss, compute_complexity(member.tree)) 
-     for member in hall_of_fame]
-  ")
-  
-  # Convert to R format
-  all_results <- lapply(results, function(r) {
-    list(
-      expr = NULL,
-      string = r[[1]],
-      mse = r[[2]],
-      rmse = sqrt(r[[2]]),
-      complexity = r[[3]]
-    )
+  var_names <- names(predictors)
+
+  max_complexity <- constraints$max_complexity %||% 30
+  n_iters <- max(n_runs * 100, 100)
+
+  # Build and run everything in a single Julia block to avoid
+  # serialization issues with complex Julia objects
+  julia_code <- sprintf('
+    begin
+      import Pkg; Pkg.activate()
+      _ed_X = Float64[%s]
+      _ed_X = reshape(_ed_X, %d, %d)
+
+      _ed_y = Float64[%s]
+
+      _ed_var_names = [%s]
+
+      _ed_options = SymbolicRegression.Options(
+          binary_operators = [+, -, *, /],
+          unary_operators = [sqrt, log, exp, sin, cos, abs],
+          parsimony = %f,
+          maxsize = %d,
+          should_optimize_constants = true,
+          progress = %s,
+          verbosity = %d,
+          seed = 42
+      )
+
+      _ed_hof = EquationSearch(
+          _ed_X, _ed_y;
+          options = _ed_options,
+          niterations = %d,
+          variable_names = _ed_var_names,
+          parallelism = :serial
+      )
+
+      _ed_results = String[]
+      _ed_losses = Float64[]
+      _ed_complexities = Int[]
+      for i in eachindex(_ed_hof.members)
+          try
+              if hasproperty(_ed_hof, :exists) && !_ed_hof.exists[i]
+                  continue
+              end
+              member = _ed_hof.members[i]
+              member === nothing && continue
+              tree = member.tree
+              expr_str = string_tree(tree, _ed_options;
+                                     variable_names = _ed_var_names)
+              push!(_ed_results, expr_str)
+              push!(_ed_losses, Float64(member.loss))
+              push!(_ed_complexities, Int(compute_complexity(tree, _ed_options)))
+          catch e
+              continue
+          end
+      end
+      (_ed_results, _ed_losses, _ed_complexities)
+    end
+  ',
+    paste(as.vector(t(X)), collapse = ", "),
+    ncol(X), nrow(X),
+    paste(y, collapse = ", "),
+    paste(sprintf('"%s"', var_names), collapse = ", "),
+    complexity_penalty,
+    max_complexity,
+    ifelse(verbose, "true", "false"),
+    ifelse(verbose, 1, 0),
+    n_iters
+  )
+
+  if (verbose) message("Starting EquationSearch (", n_iters, " iterations) via JuliaConnectoR...")
+
+  raw <- tryCatch({
+    JuliaConnectoR::juliaEval(julia_code)
+  }, error = function(e) {
+    stop("EquationSearch failed: ", e$message, call. = FALSE)
   })
-  
+
+  # Extract the three vectors from the returned tuple
+  eq_strings <- as.character(raw[[1]])
+  eq_losses <- as.numeric(raw[[2]])
+  eq_complexities <- as.integer(raw[[3]])
+
+  if (length(eq_strings) == 0) {
+    warning("No equations were extracted from the search.")
+    return(list(
+      pareto_front = data.frame(),
+      all_equations = list(),
+      best_by_complexity = list(),
+      backend = "julia",
+      n_runs = n_runs,
+      predictors = var_names
+    ))
+  }
+
+  all_results <- mapply(function(s, l, c) {
+    list(expr = NULL, string = s, mse = l, rmse = sqrt(max(l, 0)), complexity = c)
+  }, eq_strings, eq_losses, eq_complexities, SIMPLIFY = FALSE, USE.NAMES = FALSE)
+
   pareto_front <- build_pareto_front(all_results)
-  
+
   list(
     pareto_front = pareto_front,
     all_equations = all_results,
     best_by_complexity = list(),
     backend = "julia",
     n_runs = n_runs,
-    predictors = names(predictors)
+    predictors = var_names
+  )
+}
+
+
+#' Julia Backend via JuliaCall (embedding-based, legacy)
+#' @keywords internal
+symbolic_search_juliacall <- function(target, predictors, operators, constraints,
+                                       n_runs, complexity_penalty, parsimony_pressure,
+                                       julia_options, weights, verbose) {
+
+  julia_ready <- tryCatch({
+    JuliaCall::julia_setup()
+    JuliaCall::julia_library("SymbolicRegression")
+    JuliaCall::julia_library("DynamicExpressions")
+    TRUE
+  }, error = function(e) {
+    warning("Julia setup via JuliaCall failed: ", e$message,
+            "\nFalling back to R backend.")
+    FALSE
+  })
+
+  if (!julia_ready) {
+    return(symbolic_search_r_genetic(target, predictors, operators, constraints,
+                                     n_runs, complexity_penalty, parsimony_pressure,
+                                     weights, verbose))
+  }
+
+  # Source the robust Julia backend shipped with the package
+  backend_path <- system.file("julia", "symbolic_backend.jl",
+                              package = "EmpiricalDynamics")
+  if (nzchar(backend_path)) {
+    tryCatch(
+      JuliaCall::julia_source(backend_path),
+      error = function(e) {
+        if (verbose) message("Note: could not source Julia backend: ", e$message)
+      }
+    )
+  }
+
+  # Transfer data to Julia
+  X <- as.matrix(predictors)
+  y <- as.numeric(target)
+  var_names <- names(predictors)
+
+  tryCatch({
+    JuliaCall::julia_assign("_ed_X", t(X))
+    JuliaCall::julia_assign("_ed_y", y)
+    JuliaCall::julia_assign("_ed_var_names", var_names)
+    # A single predictor is transferred by JuliaCall as a scalar String, but
+    # SymbolicRegression's `variable_names` requires a Vector{String}; coerce.
+    JuliaCall::julia_command(
+      "_ed_var_names = _ed_var_names isa AbstractVector ? String.(_ed_var_names) : String[String(_ed_var_names)]")
+  }, error = function(e) {
+    stop("Failed to transfer data to Julia: ", e$message, call. = FALSE)
+  })
+
+  max_complexity <- constraints$max_complexity %||% 30
+  n_iters <- max(n_runs * 100, 100)
+
+  tryCatch({
+    options_code <- sprintf("
+      _ed_options = SymbolicRegression.Options(
+          binary_operators = [+, -, *, /],
+          unary_operators = [sqrt, log, exp, sin, cos, abs],
+          parsimony = %f,
+          maxsize = %d,
+          should_optimize_constants = true,
+          progress = %s,
+          verbosity = %d,
+          seed = 42
+      )
+    ", complexity_penalty, max_complexity,
+       ifelse(verbose, "true", "false"),
+       ifelse(verbose, 1, 0))
+    JuliaCall::julia_command(options_code)
+  }, error = function(e) {
+    stop("Failed to build SymbolicRegression.Options: ", e$message,
+         call. = FALSE)
+  })
+
+  if (verbose) message("Starting EquationSearch (", n_iters, " iterations)...")
+  tryCatch({
+    search_code <- sprintf("
+      _ed_hof = EquationSearch(
+          _ed_X, _ed_y;
+          options = _ed_options,
+          niterations = %d,
+          variable_names = _ed_var_names,
+          parallelism = :serial
+      )
+    ", n_iters)
+    JuliaCall::julia_command(search_code)
+  }, error = function(e) {
+    stop("EquationSearch failed: ", e$message, call. = FALSE)
+  })
+
+  results <- tryCatch({
+    JuliaCall::julia_command("
+      begin
+      _ed_extracted = Any[]
+      for i in eachindex(_ed_hof.members)
+          try
+              if hasproperty(_ed_hof, :exists) && !_ed_hof.exists[i]
+                  continue
+              end
+              member = _ed_hof.members[i]
+              member === nothing && continue
+              tree = member.tree
+              expr_str = string_tree(tree, _ed_options;
+                                     variable_names = _ed_var_names)
+              loss_val = Float64(member.loss)
+              compl = Int(compute_complexity(tree, _ed_options))
+              push!(_ed_extracted, (expr_str, loss_val, compl))
+          catch e
+              continue
+          end
+      end
+      end
+    ")
+    JuliaCall::julia_eval("_ed_extracted")
+  }, error = function(e) {
+    stop("Failed to extract results from HallOfFame: ", e$message,
+         call. = FALSE)
+  })
+
+  if (length(results) == 0) {
+    warning("No equations were extracted from the search.")
+    return(list(
+      pareto_front = data.frame(),
+      all_equations = list(),
+      best_by_complexity = list(),
+      backend = "julia",
+      n_runs = n_runs,
+      predictors = var_names
+    ))
+  }
+
+  all_results <- lapply(results, function(r) {
+    list(
+      expr = NULL,
+      string = r[[1]],
+      mse = r[[2]],
+      rmse = sqrt(max(r[[2]], 0)),
+      complexity = r[[3]]
+    )
+  })
+
+  pareto_front <- build_pareto_front(all_results)
+
+  list(
+    pareto_front = pareto_front,
+    all_equations = all_results,
+    best_by_complexity = list(),
+    backend = "julia",
+    n_runs = n_runs,
+    predictors = var_names
   )
 }
 
@@ -662,40 +918,66 @@ symbolic_search_julia <- function(target, predictors, operators, constraints,
 #'
 #' @export
 setup_julia_backend <- function() {
-  
-  if (!requireNamespace("JuliaCall", quietly = TRUE)) {
-    message("Package 'JuliaCall' is not installed. Please install it to use the Julia backend.")
+
+  use_connector <- requireNamespace("JuliaConnectoR", quietly = TRUE)
+  use_juliacall <- requireNamespace("JuliaCall", quietly = TRUE)
+
+  if (!use_connector && !use_juliacall) {
+    message("Neither 'JuliaConnectoR' nor 'JuliaCall' is installed.")
+    message("Install one with: install.packages('JuliaConnectoR')")
     return(FALSE)
   }
-  
+
   message("Checking Julia backend configuration...")
-  
+
+  if (use_connector) {
+    message("Using JuliaConnectoR (TCP-based)...")
+    tryCatch({
+      JuliaConnectoR::juliaEval("import Pkg; Pkg.activate(); using SymbolicRegression; using DynamicExpressions; nothing")
+      message("Julia backend is ready! (via JuliaConnectoR)")
+      return(TRUE)
+
+    }, error = function(e) {
+      msg <- e$message
+      if (grepl("not found in", msg, fixed = TRUE) ||
+          grepl("ArgumentError", msg, fixed = TRUE)) {
+        message("\n'SymbolicRegression.jl' is not installed in Julia.")
+        message("To install it, run in a terminal:")
+        message('  julia -e \'import Pkg; Pkg.add(["SymbolicRegression", "DynamicExpressions"])\'')
+      } else {
+        warning("Julia setup via JuliaConnectoR failed: ", msg)
+        message("Please ensure Julia is installed and accessible.")
+      }
+      return(FALSE)
+    })
+  }
+
+  # Fallback: JuliaCall
+  message("Using JuliaCall (embedding-based)...")
   tryCatch({
     JuliaCall::julia_setup()
-    
-    # Check if SymbolicRegression.jl is installed
+
     check_code <- '
       try
         import Pkg
-        haskey(Pkg.dependencies(), Base.UUID("8254be44-1295-4e6a-a16d-e31fe2c4a48b"))
+        haskey(Pkg.dependencies(), Base.UUID("8254be44-1295-4e6a-a16d-46603ac705cb"))
       catch
         false
       end
     '
     installed <- JuliaCall::julia_eval(check_code)
-    
+
     if (!installed) {
       message("\n'SymbolicRegression.jl' is not installed in Julia.")
-      message("To install it, please run the following in R:")
-      message("  JuliaCall::julia_library('Pkg')")
-      message("  JuliaCall::julia_command('Pkg.add(\"SymbolicRegression\")')")
+      message("To install it, run in a terminal:")
+      message('  julia -e \'import Pkg; Pkg.add(["SymbolicRegression", "DynamicExpressions"])\'')
       return(FALSE)
     }
-    
+
     JuliaCall::julia_library("SymbolicRegression")
-    message("Julia backend is ready!")
+    message("Julia backend is ready! (via JuliaCall)")
     TRUE
-    
+
   }, error = function(e) {
     warning("Julia setup failed. Error: ", e$message)
     message("Please ensure Julia is installed and accessible.")

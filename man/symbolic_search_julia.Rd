@@ -19,5 +19,7 @@ symbolic_search_julia(
 }
 \description{
 Uses SymbolicRegression.jl for advanced symbolic regression.
+Connects via JuliaConnectoR (TCP-based, robust on Windows).
+Falls back to JuliaCall if JuliaConnectoR is not available.
 }
 \keyword{internal}
