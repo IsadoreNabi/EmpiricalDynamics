@@ -1,60 +1,53 @@
-## Submission of EmpiricalDynamics 0.1.7 (bug-fix release)
+## Submission of EmpiricalDynamics 0.1.8 (bug-fix release)
 
-This is a patch release. It repairs the cross-validation of equations produced by
-the package's own symbolic search, which failed for every candidate, and the
-class of fitted object that the fallback optimiser returns, which had no methods.
-No user-facing function was removed or renamed and no argument changed meaning;
-the new arguments are additive and default to the previous behaviour. Details in
-NEWS.md:
+This is a patch release. It repairs the iterative GLS estimator for stochastic
+differential equations, whose convergence test could never be satisfied and
+which returned its last iteration rather than its best; the observation weights
+that the Julia symbolic-search backends accepted and silently discarded; and two
+internal functions that were each defined twice in the package sources. No
+exported function was removed or renamed, no argument changed meaning, and the
+one new argument is additive with a default. Details in NEWS.md:
 
-* A search returns its equations with the constants already fitted, as numeric
-  literals, so `cross_validate()` was asking `fit_specified_equation()` to
-  re-estimate an expression with nothing left to estimate. The new exported
-  function `parameterize_equation()` turns those literals into free parameters
-  starting at the discovered values, and `cross_validate()` now applies it before
-  the folds begin. `bootstrap_parameters()` and `sensitivity_analysis()` failed
-  on the same equations for the same reason and are fixed the same way.
+* `estimate_sde_iterative()` measured convergence by comparing the named
+  coefficients of successive drift equations. An equation produced by a symbolic
+  search carries its constants as numeric literals, so it has no coefficients
+  and the comparison returned `Inf` -- even for an equation compared against
+  itself, where the true change is zero. No positive tolerance exceeds `Inf`, so
+  the loop never stopped early and always exhausted `max_iter`. Convergence now
+  requires two conditions together: the relative change of the weighted deviance
+  (the quantity the GLS loop minimises) and the relative distance between
+  successive fitted functions. A criterion that cannot be evaluated, because a
+  candidate predicts non-finite values, is reported as such.
 
-* `fit_with_optim()` built objects of class `optim_fit` for which the package
-  defined no methods at all, so prediction from them failed with "no applicable
-  method for 'predict'". `predict()`, `coef()`, `fitted()`, `residuals()` and
-  `print()` methods are now registered for the class.
+* The same function returned the drift of its final iteration, which with the
+  above was always the iteration limit. It now selects over the whole
+  trajectory, scored under one common set of weights, since the GLS weights
+  change every iteration and deviances computed under different weights are not
+  comparable. The default rule, `selection = "blocked_cv"`, is blocked
+  cross-validation that refits the constants on the training blocks; blocks are
+  contiguous because these are serially dependent series, and deterministic, so
+  no seed is involved. The returned object now records `converged`,
+  `stop_reason`, the full `history` and which candidate was selected.
 
-* `nlsLM()` and `nls()` decide whether they were given weights with `missing()`,
-  and `fit_specified_equation()` always passed `weights = weights`; with the
-  default `NULL` this produced a zero-length weight vector and every
-  Levenberg-Marquardt fit failed into the fallback. The argument is now supplied
-  only when it has a value.
+* `symbolic_search(backend = "julia")` accepted a `weights` argument and did not
+  use it: both Julia arms built the search from the design matrix and response
+  alone. Because `symbolic_search_weighted()` is what the iterative estimator
+  calls, requesting a weighted fit could silently cancel the weighting step. The
+  weights are now passed through a `Dataset`.
 
-* `predict.symbolic_equation()` refused to evaluate an equation that carries its
-  constants as literals, on the grounds that it had no coefficients; it now
-  evaluates it.
-
-* `symbolic_search()` returns its candidates in `all_equations` as plain lists,
-  and `cross_validate()` refused them with "Unknown equation type", so the
-  records the package produces could not be given to the package's own
-  cross-validation. Anything carrying an expression is now accepted; a list
-  that carries no equation is still refused.
-
-* `cross_validate()` and `bootstrap_parameters()` gained an optional `weights`
-  argument, and `cross_validate()` gained `refit_engine`, which can hand the
-  per-fold re-estimation to SymbolicRegression.jl's own constant optimisation.
-  The default is the R engine, so nothing changes for a user who does not ask,
-  and no example, test or vignette requires Julia.
+* `coefficient_change()` and `block_bootstrap_indices()` were each defined twice,
+  in `utils.R` and in `validation.R`, so collation order decided which one was
+  used. The dead copy of the second returned a list where the live one returns a
+  vector. The dead copies were removed, and a test now censuses every top-level
+  definition in `R/` with the R parser and fails if any name is defined twice.
 
 ## Test environments
 
-* Local: Fedora Linux 44, R 4.6.1, with Julia 1.12.1 + SymbolicRegression.jl
-  1.13.2 present (the Julia paths are optional and are skipped when absent).
+* local: Fedora Linux 44, R 4.6.0
 
 ## R CMD check results
 
-`R CMD check --as-cran --run-donttest` on the built tarball:
-
-    Status: OK
-
 0 errors | 0 warnings | 0 notes
 
-## Reverse dependencies
-
-None; the package has no reverse dependencies on CRAN.
+The package test suite (268 assertions) passes with no failures, warnings or
+skips, both standalone and under `R CMD check --as-cran --run-donttest`.
