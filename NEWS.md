@@ -1,3 +1,21 @@
+# EmpiricalDynamics 0.1.7
+
+## The records the search produces are accepted by the search's own validator
+
+`symbolic_search()` returns its candidates in `all_equations` as plain lists --
+a string, a complexity, an error -- while `get_pareto_set()` and
+`select_equation()` wrap the same content in a `symbolic_equation`.
+`cross_validate()` insisted on the second and refused the first with *Unknown
+equation type. Expected symbolic_equation, nls, or lm object*, so the records
+the package itself hands back could not be handed to the package's own
+cross-validation. Anything carrying an expression is now accepted and classed
+at the door, in `cross_validate()`, `bootstrap_parameters()` and
+`sensitivity_analysis()` alike; a list that carries no equation is still
+refused rather than guessed at.
+
+This is what stood between a search and its own out-of-sample score for any
+caller reading `all_equations` rather than the accessors.
+
 # EmpiricalDynamics 0.1.6
 
 ## Cross-validating a discovered equation

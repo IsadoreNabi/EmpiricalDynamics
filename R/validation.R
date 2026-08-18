@@ -111,6 +111,7 @@ cross_validate <- function(equation, data, response = NULL,
 
   method <- match.arg(method)
   refit_engine <- match.arg(refit_engine)
+  equation <- as_symbolic_equation(equation)
   n <- nrow(data)
 
   if (!is.null(weights)) {
@@ -289,6 +290,36 @@ cross_validate <- function(equation, data, response = NULL,
 
   class(results) <- "cv_result"
   return(results)
+}
+
+
+#' Accept an equation in any of the shapes this package hands out
+#'
+#' \code{symbolic_search()} returns its candidates in \code{all_equations} as
+#' plain lists -- a string, a complexity, an error -- while
+#' \code{get_pareto_set()} and \code{select_equation()} wrap the same content in
+#' a \code{symbolic_equation}. Validation used to insist on the second and
+#' refuse the first with "Unknown equation type", so the records the search
+#' itself produces could not be handed to the package's own cross-validation.
+#' Anything carrying an expression is now accepted and classed here.
+#'
+#' @keywords internal
+#' @noRd
+as_symbolic_equation <- function(equation) {
+  if (inherits(equation, "symbolic_equation")) return(equation)
+  if (!is.list(equation) || is.data.frame(equation)) return(equation)
+
+  expression <- equation$expression
+  if (is.null(expression)) expression <- equation$string
+  if (is.null(expression) || !is.character(expression) ||
+      length(expression) != 1L || !nzchar(expression)) {
+    return(equation)
+  }
+
+  equation$expression <- expression
+  if (is.null(equation$string)) equation$string <- expression
+  class(equation) <- c("symbolic_equation", class(equation))
+  equation
 }
 
 
@@ -1407,6 +1438,8 @@ sensitivity_analysis <- function(equation, data, response = NULL,
     response <- derivative_col
   }
 
+  equation <- as_symbolic_equation(equation)
+
   # A discovered equation has its constants written in as literals and reports
   # no coefficients; the sensitivity being asked about is precisely the
   # sensitivity to those constants, so they are made into parameters first.
@@ -1541,6 +1574,7 @@ bootstrap_parameters <- function(equation, data, response = NULL,
     response <- derivative_col
   }
 
+  equation <- as_symbolic_equation(equation)
   n <- nrow(data)
   if (is.null(block_size)) {
     block_size <- max(1, floor(sqrt(n)))

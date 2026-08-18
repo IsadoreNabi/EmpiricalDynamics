@@ -99,6 +99,31 @@ test_that("the forms a real front contains all survive", {
   }
 })
 
+test_that("a raw record from the search is accepted, not refused", {
+  d <- cv_data()
+
+  # This is the shape `symbolic_search()` puts in `all_equations`: a plain list,
+  # with no class on it. Validation used to refuse it with "Unknown equation
+  # type", which meant the records the search itself produces could not be fed
+  # to this package's own cross-validation.
+  raw <- list(expr = NULL, string = "(x * x) * 3.93", mse = 100,
+              rmse = 10, complexity = 5L)
+
+  cv <- cross_validate(raw, data = d, response = "y", k = 3, method = "block",
+                       verbose = FALSE)
+  expect_s3_class(cv, "cv_result")
+  expect_true(all(is.finite(cv$rmse)))
+
+  expect_true(is.data.frame(bootstrap_parameters(raw, data = d, response = "y",
+                                                 n_boot = 10)))
+  expect_true(is.data.frame(sensitivity_analysis(raw, data = d, response = "y")))
+
+  # A list that carries no equation is still refused rather than guessed at.
+  expect_error(cross_validate(list(a = 1), data = d, response = "y", k = 3,
+                              verbose = FALSE),
+               "Unknown equation type")
+})
+
 test_that("the fields the object already promised are still there", {
   d <- cv_data()
 

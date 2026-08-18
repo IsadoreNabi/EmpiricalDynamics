@@ -1,4 +1,4 @@
-## Submission of EmpiricalDynamics 0.1.6 (bug-fix release)
+## Submission of EmpiricalDynamics 0.1.7 (bug-fix release)
 
 This is a patch release. It repairs the cross-validation of equations produced by
 the package's own symbolic search, which failed for every candidate, and the
@@ -29,6 +29,12 @@ NEWS.md:
 * `predict.symbolic_equation()` refused to evaluate an equation that carries its
   constants as literals, on the grounds that it had no coefficients; it now
   evaluates it.
+
+* `symbolic_search()` returns its candidates in `all_equations` as plain lists,
+  and `cross_validate()` refused them with "Unknown equation type", so the
+  records the package produces could not be given to the package's own
+  cross-validation. Anything carrying an expression is now accepted; a list
+  that carries no equation is still refused.
 
 * `cross_validate()` and `bootstrap_parameters()` gained an optional `weights`
   argument, and `cross_validate()` gained `refit_engine`, which can hand the
