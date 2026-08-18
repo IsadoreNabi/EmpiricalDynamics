@@ -32,7 +32,10 @@ NULL
 #' @param parsimony_pressure Type of parsimony: "constant", "adaptive", or "none".
 #' @param backend Computation backend: "julia", "r_genetic", or "r_exhaustive".
 #' @param julia_options List of options passed to SymbolicRegression.jl.
-#' @param weights Optional weight vector for weighted regression.
+#' @param weights Optional weight vector for weighted regression. Honoured by
+#'   every backend: the Julia arms pass it to SymbolicRegression.jl through a
+#'   \code{Dataset}. Until August 2026 they did not, and a weighted search
+#'   silently returned an unweighted one.
 #' @param verbose Print progress messages?
 #'
 #' @return An object of class "symbolic_search_result" containing:
@@ -657,6 +660,8 @@ symbolic_search_julia_connector <- function(target, predictors, operators, const
 
       _ed_y = Float64[%s]
 
+      _ed_w = Float64[%s]
+
       _ed_var_names = [%s]
 
       _ed_options = SymbolicRegression.Options(
@@ -670,11 +675,22 @@ symbolic_search_julia_connector <- function(target, predictors, operators, const
           seed = 42
       )
 
-      _ed_hof = EquationSearch(
+      # The weights travel through a Dataset, which is how this package already
+      # hands them to SymbolicRegression.jl in ed_refit_constants(). Until
+      # August 2026 both Julia arms built the search from X and y alone and the
+      # `weights` argument died here: symbolic_search_weighted() asked for a
+      # weighted fit and silently got an unweighted one, which cancelled the
+      # GLS step of the iterative SDE loop without a word.
+      _ed_dataset = SymbolicRegression.Dataset(
           _ed_X, _ed_y;
+          weights = _ed_w,
+          variable_names = _ed_var_names
+      )
+
+      _ed_hof = EquationSearch(
+          _ed_dataset;
           options = _ed_options,
           niterations = %d,
-          variable_names = _ed_var_names,
           parallelism = :serial
       )
 
@@ -704,6 +720,7 @@ symbolic_search_julia_connector <- function(target, predictors, operators, const
     paste(as.vector(t(X)), collapse = ", "),
     ncol(X), nrow(X),
     paste(y, collapse = ", "),
+    paste(as.numeric(weights), collapse = ", "),
     paste(sprintf('"%s"', var_names), collapse = ", "),
     complexity_penalty,
     max_complexity,
@@ -797,6 +814,7 @@ symbolic_search_juliacall <- function(target, predictors, operators, constraints
   tryCatch({
     JuliaCall::julia_assign("_ed_X", t(X))
     JuliaCall::julia_assign("_ed_y", y)
+    JuliaCall::julia_assign("_ed_w", as.numeric(weights))
     JuliaCall::julia_assign("_ed_var_names", var_names)
     # A single predictor is transferred by JuliaCall as a scalar String, but
     # SymbolicRegression's `variable_names` requires a Vector{String}; coerce.
@@ -833,11 +851,22 @@ symbolic_search_juliacall <- function(target, predictors, operators, constraints
   if (verbose) message("Starting EquationSearch (", n_iters, " iterations)...")
   tryCatch({
     search_code <- sprintf("
-      _ed_hof = EquationSearch(
+      # The weights travel through a Dataset, which is how this package already
+      # hands them to SymbolicRegression.jl in ed_refit_constants(). Until
+      # August 2026 both Julia arms built the search from X and y alone and the
+      # `weights` argument died here: symbolic_search_weighted() asked for a
+      # weighted fit and silently got an unweighted one, which cancelled the
+      # GLS step of the iterative SDE loop without a word.
+      _ed_dataset = SymbolicRegression.Dataset(
           _ed_X, _ed_y;
+          weights = _ed_w,
+          variable_names = _ed_var_names
+      )
+
+      _ed_hof = EquationSearch(
+          _ed_dataset;
           options = _ed_options,
           niterations = %d,
-          variable_names = _ed_var_names,
           parallelism = :serial
       )
     ", n_iters)

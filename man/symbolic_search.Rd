@@ -47,7 +47,10 @@ symbolic_search(
 
 \item{julia_options}{List of options passed to SymbolicRegression.jl.}
 
-\item{weights}{Optional weight vector for weighted regression.}
+\item{weights}{Optional weight vector for weighted regression. Honoured by
+every backend: the Julia arms pass it to SymbolicRegression.jl through a
+\code{Dataset}. Until August 2026 they did not, and a weighted search
+silently returned an unweighted one.}
 
 \item{verbose}{Print progress messages?}
 }

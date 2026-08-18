@@ -20,7 +20,10 @@ symbolic_search_weighted(
 
 \item{predictors}{Data frame of predictor variables.}
 
-\item{weights}{Optional weight vector for weighted regression.}
+\item{weights}{Optional weight vector for weighted regression. Honoured by
+every backend: the Julia arms pass it to SymbolicRegression.jl through a
+\code{Dataset}. Until August 2026 they did not, and a weighted search
+silently returned an unweighted one.}
 
 \item{operators}{List specifying allowed operators:
 \itemize{

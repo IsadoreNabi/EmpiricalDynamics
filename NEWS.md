@@ -1,3 +1,94 @@
+# EmpiricalDynamics 0.1.8
+
+## The iterative GLS loop could not converge, and did not say so
+
+`estimate_sde_iterative()` measured convergence with `coefficient_change()`,
+which compares the *named coefficients* of two equations. An equation that came
+out of a symbolic search carries its constants as literals -- `(Z * Z) * 3.93`,
+not `(Z * Z) * a` -- so it has no coefficients, `coef()` returns `NULL` and the
+comparison returns `Inf`. Handed the *same equation twice*, where the true
+change is exactly zero, it still returned `Inf`. No positive tolerance exceeds
+`Inf`, so the loop never stopped early: it always exhausted `max_iter` and left
+through the warning.
+
+Convergence is now declared only when **two** conditions hold together: the
+relative change of the **weighted deviance** -- the quantity the GLS loop is
+actually minimising, measured under the weights of the iteration rather than
+with an unweighted RMSE -- and the relative distance between successive fitted
+functions. Either alone has a failure mode the other covers: measured on a
+production run, the objective moved 0.065% between two iterations whose
+predictions differed by 9.2%, while the structure changed and moved *away* from
+the known truth. A criterion that cannot be evaluated, because an equation
+predicts non-finite values, is now reported as such instead of standing in for
+a convergence that never arrives.
+
+## The loop returned its last iteration rather than its best
+
+It returned `f_current`, whatever the final round happened to produce -- and
+with the criterion above, the final round was always `max_iter`. Measured on a
+production run, the last iteration was further from the known truth than the one
+before it.
+
+Keeping "the best so far" as the loop runs would have been wrong too, and less
+visibly: the GLS weights change every iteration, so each iteration's deviance is
+computed on a different scale and the numbers are not comparable with one
+another. Measured on clean data, iteration 2 scored 1.47587 against iteration
+1's 1.74385 under their own weights, and 1.47587 against 1.47587 -- identical --
+once both were scored under the same ones.
+
+So the choice is made once, at the end, over the whole trajectory. Which rule
+does the ranking was settled by measurement rather than by argument: three
+candidate rules -- weighted deviance, a description length charging for
+constants and structure, and blocked cross-validation that **refits** the
+constants on the training blocks -- were compared over sixteen real
+trajectories against a known truth, under a decision rule written before the
+numbers were seen. Cross-validation with refitting won on both the mean and the
+median excess error (0.386 and 0.228, against 0.407 and 0.337 for the plain
+deviance), and is now the default, as `selection = "blocked_cv"`. The blocks are
+contiguous and not random, which is the part of the name that carries
+information: these series have serial dependence, and a randomly held-out point
+sits between its own neighbours. `selection = "deviance"` remains available and
+is what the default falls back to when no block can be scored.
+
+Refitting is what makes the held-out blocks informative. An equation from a
+search carries its constants as literals, so a split that does not re-estimate
+them leaves the equation unchanged and the held-out error is the in-sample error
+cut into pieces. The blocks are contiguous, because these series carry serial
+dependence, and deterministic, so the choice needs no seed; they are aggregated
+by their mass of weights rather than by a flat mean.
+
+Candidates that predict non-finite values are excluded from the choice, and
+listed in `selection_excluded`: whatever else they are, they cannot be the drift
+the function returns.
+
+## The Julia backends discarded the observation weights
+
+`symbolic_search(backend = "julia")` accepted `weights` and never used them.
+Both Julia arms built their search from `X` and `y` alone, and the argument
+survived only in the fallback to `r_genetic`. Because `symbolic_search_weighted()`
+is what `estimate_sde_iterative()` calls, asking for a weighted fit could
+silently cancel the GLS step it exists to apply.
+
+The weights now travel through a `Dataset`, which is how this package already
+hands them to SymbolicRegression.jl elsewhere. Verified with two halves obeying
+different laws: with weights of 1000 and 1e-6, the search recovers the law of
+the heavy half instead of a compromise between them.
+
+## Two functions were defined twice
+
+`coefficient_change()` and `block_bootstrap_indices()` each existed in both
+`utils.R` and `validation.R`. With no `Collate` field, collation is alphabetical
+and `validation.R` won both, silently. The pair of `coefficient_change()` was
+harmless -- the two bodies computed the same thing -- but the other was not: the
+dead `block_bootstrap_indices()` returned a *list* of 200 resamples and made
+`block_size` optional, where the live one returns a single vector and requires
+it. Reading the dead copy and calling it as written there raised "argument
+\"block_size\" is missing".
+
+The dead copies are gone, and a test now censuses every top-level definition in
+`R/` with the parser -- not with a regular expression, which counts assignments
+inside strings -- and fails naming the pair if any name is defined twice.
+
 # EmpiricalDynamics 0.1.7
 
 ## The records the search produces are accepted by the search's own validator

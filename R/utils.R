@@ -91,24 +91,6 @@ read_empirical_data <- function(file, time_col = NULL, date_format = NULL, ...) 
 }
 
 
-#' Calculate Coefficient Change (Internal)
-#' @noRd
-coefficient_change <- function(eq_new, eq_old) {
-  coef_new <- stats::coef(eq_new)
-  coef_old <- stats::coef(eq_old)
-  
-  if (is.null(coef_new) || is.null(coef_old)) {
-    return(Inf)
-  }
-  
-  common <- intersect(names(coef_new), names(coef_old))
-  
-  if (length(common) == 0) {
-    return(Inf)
-  }
-  
-  sqrt(mean((coef_new[common] - coef_old[common])^2))
-}
 
 
 #' Default ggplot2 Theme for EmpiricalDynamics
@@ -275,21 +257,6 @@ format_number <- function(x, digits = 4, scientific = TRUE) {
 }
 
 
-#' Generate Block Bootstrap Indices (Internal)
-#' @noRd
-block_bootstrap_indices <- function(n, block_size = NULL, n_samples = 200) {
-  if (is.null(block_size)) {
-    block_size <- max(5, floor(n^(1/3)))
-  }
-  n_blocks <- ceiling(n / block_size)
-  max_start <- n - block_size + 1
-  
-  lapply(1:n_samples, function(i) {
-    starts <- sample(1:max_start, n_blocks, replace = TRUE)
-    indices <- unlist(lapply(starts, function(s) s:(s + block_size - 1)))
-    indices[1:n]
-  })
-}
 
 
 #' Print Rule (Internal)
