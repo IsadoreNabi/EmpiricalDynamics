@@ -1,7 +1,7 @@
 Package: EmpiricalDynamics
 Title: Empirical Discovery of Differential Equations from Time Series
         Data
-Version: 0.1.5
+Version: 0.1.6
 Authors@R: 
     person("José Mauricio", "Gómez Julián", email = "isadore.nabi@pm.me", role = c("aut", "cre"),
            comment = c(ORCID = "0009-0000-2412-3150"))
@@ -17,7 +17,6 @@ Description: A comprehensive toolkit for discovering differential and difference
 License: MIT + file LICENSE
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
-RoxygenNote: 7.3.3
 SystemRequirements: Julia (>= 1.6)
 Depends: R (>= 4.0.0)
 Imports: CVXR (>= 1.8), minpack.lm (>= 1.2), signal (>= 0.7), lmtest
@@ -35,3 +34,4 @@ Packaged: 2026-03-31 18:06:56 UTC; ROG
 Author: José Mauricio Gómez Julián [aut, cre]
     (<https://orcid.org/0009-0000-2412-3150>)
 Maintainer: José Mauricio Gómez Julián <isadore.nabi@pm.me>
+Config/roxygen2/version: 8.0.0

@@ -29,7 +29,28 @@ NULL
 #' @param horizon For rolling CV, forecast horizon.
 #' @param refit_derivative Logical; whether to recompute derivatives for each fold (currently unused).
 #' @param diff_method Differentiation method if refitting (currently unused).
+#' @param weights Optional vector of observation weights, one per row of
+#'   \code{data}. Each fold is refitted with the weights of its own training
+#'   rows, so that a search run under weights is validated under them too.
+#' @param refit_engine Which engine re-estimates the constants on each training
+#'   fold: \code{"r"} (the default) uses this package's nonlinear least squares;
+#'   \code{"julia"} hands the equation to SymbolicRegression.jl's own constant
+#'   optimisation, which is the optimiser and the loss the search itself used,
+#'   and requires Julia and the \code{JuliaCall} package. The default is
+#'   \code{"r"} so that the figure a given equation gets does not depend on
+#'   what happens to be installed on the machine.
 #' @param verbose Print progress.
+#'
+#' @details A discovered equation arrives with its constants already fitted, as
+#'   numeric literals, and there is nothing in it left to estimate. Before the
+#'   folds begin, such an equation is passed through
+#'   \code{\link{parameterize_equation}}: its literals become free parameters
+#'   starting at the values the search found, and each fold re-estimates them on
+#'   its own training rows. An equation specified by the user, which already has
+#'   named free parameters, keeps taking its starting values from its own
+#'   coefficients. An equation with no constants at all is not refitted -- there
+#'   is nothing to refit -- and is scored by evaluating it on the held-out rows;
+#'   the returned object says so in \code{refitted}.
 #'
 #' @return Object of class "cv_result" containing:
 #'   \item{rmse}{Root mean squared error per fold}
@@ -39,6 +60,13 @@ NULL
 #'   \item{sd_rmse}{Standard deviation of RMSE}
 #'   \item{predictions}{List of predicted vs actual per fold}
 #'   \item{fold_indices}{Indices used for each fold}
+#'   \item{refitted}{Whether the equation was re-estimated on each fold}
+#'   \item{parameterization}{The parameterised expression that was refitted, when
+#'     the equation was a discovered one, and \code{NULL} otherwise}
+#'   \item{refit_engine}{The engine that did the refitting}
+#'   \item{stalled_folds}{Folds in which the Julia optimiser did not move off
+#'     its starting constants, so the error reported for them is that of the
+#'     equation as the search left it. Empty for the R engine.}
 #'
 #' @examples
 #' \donttest{
@@ -69,8 +97,10 @@ cross_validate <- function(equation, data, response = NULL,
                            horizon = 1,
                            refit_derivative = FALSE,
                            diff_method = "tvr",
+                           weights = NULL,
+                           refit_engine = c("r", "julia"),
                            verbose = TRUE) {
-  
+
   # Compatibility: derivative_col is alias for response
   if (is.null(response) && !is.null(derivative_col)) {
     response <- derivative_col
@@ -78,9 +108,20 @@ cross_validate <- function(equation, data, response = NULL,
   if (is.null(response)) {
     stop("Must specify 'response' or 'derivative_col'", call. = FALSE)
   }
-  
+
   method <- match.arg(method)
+  refit_engine <- match.arg(refit_engine)
   n <- nrow(data)
+
+  if (!is.null(weights)) {
+    if (!is.numeric(weights) || length(weights) != n) {
+      stop("'weights' must be a numeric vector with one value per row of 'data'.",
+           call. = FALSE)
+    }
+    if (any(!is.finite(weights)) || any(weights < 0)) {
+      stop("'weights' must be finite and non-negative.", call. = FALSE)
+    }
+  }
   
   # Generate fold indices
   fold_indices <- switch(method,
@@ -91,7 +132,14 @@ cross_validate <- function(equation, data, response = NULL,
   
   # Extract formula from equation
   if (inherits(equation, "symbolic_equation")) {
-    eq_expr <- equation$expression
+    eq_expr <- if (!is.null(equation$expression)) {
+      equation$expression
+    } else {
+      equation$string
+    }
+    if (is.null(eq_expr)) {
+      stop("The equation carries neither an expression nor a string.", call. = FALSE)
+    }
     eq_type <- "symbolic"
   } else if (inherits(equation, "nls")) {
     form <- stats::formula(equation)
@@ -103,6 +151,19 @@ cross_validate <- function(equation, data, response = NULL,
     stop("Unknown equation type. Expected symbolic_equation, nls, or lm object.")
   }
   
+  # How the equation will be re-estimated, decided once rather than per fold.
+  plan <- if (eq_type == "symbolic") {
+    cv_refit_plan(eq_expr, equation, data)
+  } else {
+    list(kind = eq_type, expression = NULL, start = NULL,
+         n_parameters = NA_integer_)
+  }
+
+  if (identical(refit_engine, "julia") && eq_type != "symbolic") {
+    stop("'refit_engine = \"julia\"' applies to symbolic equations only.",
+         call. = FALSE)
+  }
+
   # Storage for results
   results <- list(
     rmse = numeric(k),
@@ -111,53 +172,78 @@ cross_validate <- function(equation, data, response = NULL,
     predictions = vector("list", k),
     fold_indices = fold_indices
   )
-  
+
+  # Folds where the Julia optimiser did not move off its starting point.
+  stalled <- integer(0)
+
   for (i in seq_len(k)) {
     if (verbose) message("Fold ", i, "/", k)
-    
+
     test_idx <- fold_indices[[i]]
     train_idx <- setdiff(seq_len(n), test_idx)
-    
+
     train_data <- data[train_idx, , drop = FALSE]
     test_data <- data[test_idx, , drop = FALSE]
-    
-    # Refit on training data
-    fitted_model <- tryCatch({
+    train_weights <- if (is.null(weights)) NULL else weights[train_idx]
+
+    # Refit on training data and predict on the held-out rows
+    pred <- tryCatch({
       if (eq_type == "lm") {
-        stats::lm(form, data = train_data)
+        stats::predict(stats::lm(form, data = train_data), newdata = test_data)
+
       } else if (eq_type == "nls") {
         if (!requireNamespace("minpack.lm", quietly = TRUE)) {
           stop("Package 'minpack.lm' is required for NLS fitting.")
         }
         # For NLS, need starting values
         start_vals <- as.list(stats::coef(equation))
-        minpack.lm::nlsLM(form, data = train_data, start = start_vals,
-                          control = minpack.lm::nls.lm.control(maxiter = 200))
+        args <- list(formula = form, data = train_data, start = start_vals,
+                     control = minpack.lm::nls.lm.control(maxiter = 200))
+        if (!is.null(train_weights)) args$weights <- train_weights
+        stats::predict(do.call(minpack.lm::nlsLM, args), newdata = test_data)
+
+      } else if (identical(refit_engine, "julia")) {
+        got <- ed_julia_refit(eq_expr, train_data = train_data,
+                              test_data = test_data, response = response,
+                              weights = train_weights)
+        if (!isTRUE(got$ok)) stop(got$message, call. = FALSE)
+        if (identical(plan$kind, "discovered") && !isTRUE(got$moved)) {
+          stalled <- c(stalled, i)
+        }
+        got$predictions
+
+      } else if (identical(plan$kind, "fixed")) {
+        # Nothing to estimate: the equation is scored as it stands.
+        rep_len(as.numeric(eval(parse(text = plan$expression),
+                                envir = create_eval_env(test_data))),
+                nrow(test_data))
+
       } else {
-        # Symbolic equation - use fit_specified_equation
-        fit_specified_equation(
-          eq_expr,
+        fitted_model <- fit_specified_equation(
+          plan$expression,
           data = train_data,
           response = response,
-          start = as.list(stats::coef(equation))
+          start = plan$start,
+          method = cv_fit_method(plan$expression, train_data),
+          weights = train_weights
         )
+        stats::predict(fitted_model, newdata = test_data)
       }
     }, error = function(e) {
-      warning("Fold ", i, " fitting failed: ", e$message)
+      warning("Fold ", i, " fitting failed: ", conditionMessage(e))
       NULL
     })
-    
-    if (is.null(fitted_model)) {
+
+    if (is.null(pred)) {
       results$rmse[i] <- NA
       results$mae[i] <- NA
       results$r_squared[i] <- NA
       next
     }
-    
-    # Predict on test data
-    pred <- stats::predict(fitted_model, newdata = test_data)
+
+    pred <- as.numeric(pred)
     actual <- test_data[[response]]
-    
+
     # Calculate metrics
     residuals <- actual - pred
     results$rmse[i] <- sqrt(mean(residuals^2, na.rm = TRUE))
@@ -182,9 +268,75 @@ cross_validate <- function(equation, data, response = NULL,
   results$mean_r_squared <- mean(results$r_squared, na.rm = TRUE)
   results$method <- method
   results$k <- k
-  
+  results$refitted <- !identical(plan$kind, "fixed")
+  results$parameterization <- if (identical(plan$kind, "discovered")) {
+    plan$expression
+  } else {
+    NULL
+  }
+  results$refit_engine <- if (eq_type == "symbolic") refit_engine else "r"
+
+  # Reported rather than hidden: the search's constant optimisation perturbs
+  # its restarts multiplicatively, so a constant the search left at zero cannot
+  # move, and the error below is the error of the equation as it stands, not of
+  # the equation refitted.
+  results$stalled_folds <- stalled
+  if (length(stalled) > 0L) {
+    warning("The Julia optimiser did not move off its starting constants in ",
+            length(stalled), " of ", k, " folds; the error reported for those ",
+            "folds is that of the equation as the search left it")
+  }
+
   class(results) <- "cv_result"
   return(results)
+}
+
+
+#' Decide how an equation is to be re-estimated on each fold
+#'
+#' Three cases. An equation whose expression mentions names the data does not
+#' carry has free parameters already and is refitted as it stands. A discovered
+#' equation mentions only data columns, because its constants are literals: it
+#' is parameterised, and the literals become the starting values. An equation
+#' that mentions only data columns and carries no literal has nothing to
+#' estimate.
+#'
+#' @keywords internal
+#' @noRd
+cv_refit_plan <- function(eq_expr, equation, data) {
+  free <- setdiff(all.vars(parse(text = eq_expr)), names(data))
+
+  if (length(free) > 0L) {
+    coefs <- stats::coef(equation)
+    start <- if (!is.null(coefs) && length(coefs) > 0L) as.list(coefs) else NULL
+    return(list(kind = "specified", expression = eq_expr, start = start,
+                n_parameters = length(free)))
+  }
+
+  parameterised <- parameterize_equation(eq_expr, data = data)
+  if (parameterised$n_parameters == 0L) {
+    return(list(kind = "fixed", expression = eq_expr, start = list(),
+                n_parameters = 0L))
+  }
+
+  list(kind = "discovered", expression = parameterised$expression,
+       start = parameterised$start, n_parameters = parameterised$n_parameters)
+}
+
+
+#' Which optimiser to refit an expression with
+#'
+#' An equation that mentions no variable at all -- a bare constant, which the
+#' search does propose at complexity one -- has a one-by-one gradient, and the
+#' nonlinear least squares routines recycle it against the full weight vector.
+#' Such an equation is fitted by general optimisation instead, where a scalar
+#' prediction is expected.
+#'
+#' @keywords internal
+#' @noRd
+cv_fit_method <- function(expression, data) {
+  mentioned <- intersect(all.vars(parse(text = expression)), names(data))
+  if (length(mentioned) == 0L) "optim" else "LM"
 }
 
 #' Create Random Folds
@@ -236,7 +388,19 @@ create_rolling_folds <- function(n, k, horizon = 1) {
 print.cv_result <- function(x, ...) {
   cat("Cross-Validation Results\n")
   cat("========================\n")
-  cat("Method:", x$method, "with", x$k, "folds\n\n")
+  cat("Method:", x$method, "with", x$k, "folds\n")
+  if (!is.null(x$refitted)) {
+    if (isTRUE(x$refitted)) {
+      cat("Refitted per fold with the", x$refit_engine, "engine")
+      if (!is.null(x$parameterization)) {
+        cat(" as:", x$parameterization)
+      }
+      cat("\n")
+    } else {
+      cat("Not refitted: the equation carries no constant to estimate\n")
+    }
+  }
+  cat("\n")
   cat("RMSE:     ", sprintf("%.4f (SD: %.4f)", x$mean_rmse, x$sd_rmse), "\n")
   cat("MAE:      ", sprintf("%.4f", x$mean_mae), "\n")
   cat("R-squared:", sprintf("%.4f", x$mean_r_squared), "\n\n")
@@ -1242,11 +1406,27 @@ sensitivity_analysis <- function(equation, data, response = NULL,
   if (is.null(response) && !is.null(derivative_col)) {
     response <- derivative_col
   }
-  
+
+  # A discovered equation has its constants written in as literals and reports
+  # no coefficients; the sensitivity being asked about is precisely the
+  # sensitivity to those constants, so they are made into parameters first.
+  if (inherits(equation, "symbolic_equation") &&
+      length(stats::coef(equation)) == 0L) {
+    eq_expr <- if (!is.null(equation$expression)) equation$expression else equation$string
+    if (!is.null(eq_expr)) {
+      plan <- cv_refit_plan(eq_expr, equation, data)
+      if (identical(plan$kind, "discovered")) {
+        equation$expression <- plan$expression
+        equation$string <- plan$expression
+        equation$coefficients <- unlist(plan$start)
+      }
+    }
+  }
+
   coefs <- stats::coef(equation)
   if (is.null(coefs) || length(coefs) == 0) {
     warning("No coefficients found in equation")
-    return(data.frame(parameter = character(0), estimate = numeric(0), 
+    return(data.frame(parameter = character(0), estimate = numeric(0),
                       sensitivity = numeric(0), elasticity = numeric(0)))
   }
   
@@ -1339,6 +1519,13 @@ eval_with_coefs <- function(equation, data, new_coefs) {
 #' @param n_boot Number of bootstrap samples.
 #' @param conf_level Confidence level (default 0.95).
 #' @param block_size Block size for block bootstrap (time series).
+#' @param weights Optional vector of observation weights, one per row of
+#'   \code{data}.
+#'
+#' @details A discovered equation carries its constants as literals and has no
+#'   coefficients to resample. It is therefore parameterised first, exactly as
+#'   in \code{\link{cross_validate}}, and what is resampled are the parameters
+#'   that stand in for those literals.
 #'
 #' @return Data frame with parameter estimates and confidence intervals.
 #' @export
@@ -1346,62 +1533,107 @@ bootstrap_parameters <- function(equation, data, response = NULL,
                                  derivative_col = NULL,
                                  n_boot = 500,
                                  conf_level = 0.95,
-                                 block_size = NULL) {
-  
+                                 block_size = NULL,
+                                 weights = NULL) {
+
   # Compatibility
   if (is.null(response) && !is.null(derivative_col)) {
     response <- derivative_col
   }
-  
+
   n <- nrow(data)
   if (is.null(block_size)) {
     block_size <- max(1, floor(sqrt(n)))
   }
-  
-  original_coefs <- stats::coef(equation)
+
+  if (!is.null(weights) &&
+      (!is.numeric(weights) || length(weights) != n)) {
+    stop("'weights' must be a numeric vector with one value per row of 'data'.",
+         call. = FALSE)
+  }
+
+  # Get expression for refitting, and the parameters to resample
+  eq_expr <- NULL
+  if (inherits(equation, "symbolic_equation")) {
+    eq_expr <- if (!is.null(equation$expression)) equation$expression else equation$string
+    plan <- cv_refit_plan(eq_expr, equation, data)
+    if (identical(plan$kind, "fixed")) {
+      warning("The equation carries no constant to resample")
+      return(data.frame(parameter = character(0), estimate = numeric(0),
+                        se = numeric(0), ci_lower = numeric(0),
+                        ci_upper = numeric(0)))
+    }
+    eq_expr <- plan$expression
+    original_coefs <- if (identical(plan$kind, "discovered")) {
+      # The literal the search wrote down is a starting value, not the estimate
+      # this resampling is about: the estimate is what the constant comes to on
+      # the whole sample, which is what each replicate re-estimates. Taking the
+      # literal instead would report an interval that need not even contain the
+      # point it is drawn around.
+      on_full <- tryCatch(
+        stats::coef(fit_specified_equation(
+          eq_expr, data = data, response = response,
+          start = as.list(unlist(plan$start)),
+          method = cv_fit_method(eq_expr, data), weights = weights)),
+        error = function(e) NULL)
+      if (is.null(on_full)) {
+        warning("The equation could not be fitted on the full sample; ",
+                "the constants found by the search are reported instead")
+        unlist(plan$start)
+      } else {
+        on_full
+      }
+    } else {
+      stats::coef(equation)
+    }
+  } else if (inherits(equation, "nls") || inherits(equation, "lm")) {
+    eq_form <- stats::formula(equation)
+    original_coefs <- stats::coef(equation)
+  } else {
+    original_coefs <- stats::coef(equation)
+  }
+
   if (is.null(original_coefs) || length(original_coefs) == 0) {
     warning("No coefficients found in equation")
     return(data.frame(parameter = character(0), estimate = numeric(0),
                       se = numeric(0), ci_lower = numeric(0), ci_upper = numeric(0)))
   }
-  
+
   n_coef <- length(original_coefs)
-  
+
   # Storage for bootstrap estimates
   boot_coefs <- matrix(NA, nrow = n_boot, ncol = n_coef)
   colnames(boot_coefs) <- names(original_coefs)
-  
-  # Get expression for refitting
-  if (inherits(equation, "symbolic_equation")) {
-    eq_expr <- if (!is.null(equation$expression)) equation$expression else equation$string
-  } else if (inherits(equation, "nls")) {
-    eq_form <- stats::formula(equation)
-  } else if (inherits(equation, "lm")) {
-    eq_form <- stats::formula(equation)
-  }
-  
+
   for (b in 1:n_boot) {
     # Block bootstrap indices
     boot_idx <- block_bootstrap_indices(n, block_size)
     boot_data <- data[boot_idx, , drop = FALSE]
-    
+    boot_weights <- if (is.null(weights)) NULL else weights[boot_idx]
+
     # Refit on bootstrap sample
     tryCatch({
       if (inherits(equation, "lm")) {
-        fit <- stats::lm(eq_form, data = boot_data)
+        args <- list(formula = eq_form, data = boot_data)
+        if (!is.null(boot_weights)) args$weights <- boot_weights
+        fit <- do.call(stats::lm, args)
         boot_coefs[b, ] <- stats::coef(fit)[names(original_coefs)]
       } else if (inherits(equation, "nls")) {
         if (!requireNamespace("minpack.lm", quietly = TRUE)) {
           stop("minpack.lm required")
         }
-        fit <- minpack.lm::nlsLM(eq_form, data = boot_data, 
-                                 start = as.list(original_coefs),
-                                 control = minpack.lm::nls.lm.control(maxiter = 100))
+        args <- list(formula = eq_form, data = boot_data,
+                     start = as.list(original_coefs),
+                     control = minpack.lm::nls.lm.control(maxiter = 100))
+        if (!is.null(boot_weights)) args$weights <- boot_weights
+        fit <- do.call(minpack.lm::nlsLM, args)
         boot_coefs[b, ] <- stats::coef(fit)[names(original_coefs)]
       } else if (inherits(equation, "symbolic_equation")) {
         fit <- fit_specified_equation(eq_expr, data = boot_data,
                                       response = response,
-                                      start = as.list(original_coefs))
+                                      start = as.list(original_coefs),
+                                      method = cv_fit_method(eq_expr, boot_data),
+                                      weights = boot_weights)
         boot_coefs[b, ] <- stats::coef(fit)[names(original_coefs)]
       }
     }, error = function(e) {

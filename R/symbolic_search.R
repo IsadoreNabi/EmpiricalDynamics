@@ -1079,28 +1079,36 @@ fit_specified_equation <- function(expression, data, response = NULL,
   nls_formula <- stats::as.formula(paste(response, "~", expression))
   
   # Define fitting functions
+  # `nlsLM()` and `nls()` both decide whether they were given weights with
+  # `missing(weights)`, so handing them `weights = NULL` is not the same as
+  # omitting the argument: the weight vector comes out zero-length, the
+  # residual vector is multiplied down to nothing and the fit dies with
+  # "evaluation of fn function returns non-sensible value!". The argument is
+  # therefore supplied only when there is something to supply.
   try_lm <- function() {
     if (!requireNamespace("minpack.lm", quietly = TRUE)) {
       stop("Package 'minpack.lm' is required for LM optimization.")
     }
     # nls.lm.control DOES NOT ACCEPT warnOnly
-    minpack.lm::nlsLM(
+    args <- list(
       formula = nls_formula,
       data = data,
       start = start,
-      weights = weights,
       control = minpack.lm::nls.lm.control(maxiter = 500)
     )
+    if (!is.null(weights)) args$weights <- weights
+    do.call(minpack.lm::nlsLM, args)
   }
-  
+
   try_nls <- function() {
-    stats::nls(
+    args <- list(
       formula = nls_formula,
       data = data,
       start = start,
-      weights = weights,
       control = stats::nls.control(maxiter = 200, warnOnly = TRUE)
     )
+    if (!is.null(weights)) args$weights <- weights
+    do.call(stats::nls, args)
   }
   
   try_optim <- function() {
@@ -1172,9 +1180,18 @@ fit_with_optim <- function(target_name, expression, data, start,
     lower = lower,
     upper = upper
   )
-  
+
   names(result$par) <- names(start)
-  
+
+  # The object has to carry everything its methods will be asked for later:
+  # this is the class the general fallback hands back, and whoever receives it
+  # expects to be able to predict from it like from any other fit.
+  fitted_vals <- rep_len(
+    as.numeric(eval(parse(text = expression),
+                    envir = create_eval_env(data, as.list(result$par)))),
+    nrow(data)
+  )
+
   structure(
     list(
       m = list(
@@ -1183,9 +1200,206 @@ fit_with_optim <- function(target_name, expression, data, start,
       ),
       convergence = result$convergence,
       message = result$message,
-      coefficients = result$par
+      coefficients = result$par,
+      expression = expression,
+      target = target_name,
+      fitted.values = fitted_vals,
+      residuals = target_vals - fitted_vals,
+      weights = weights,
+      value = result$value
     ),
     class = "optim_fit"
+  )
+}
+
+
+# S3 Methods for optim_fit
+#
+# `fit_with_optim()` is the last fallback of `fit_specified_equation()`, and the
+# object it builds used to have no methods at all: the moment that fallback was
+# taken, prediction died with "no applicable method for 'predict' applied to an
+# object of class optim_fit". These are that missing set.
+
+#' @export
+predict.optim_fit <- function(object, newdata = NULL, ...) {
+  if (is.null(newdata)) return(object$fitted.values)
+  newdata <- as.data.frame(newdata)
+  out <- eval(parse(text = object$expression),
+              envir = create_eval_env(newdata, as.list(object$coefficients)))
+  rep_len(as.numeric(out), nrow(newdata))
+}
+
+
+#' @export
+coef.optim_fit <- function(object, ...) {
+  object$coefficients
+}
+
+
+#' @export
+fitted.optim_fit <- function(object, ...) {
+  object$fitted.values
+}
+
+
+#' @export
+residuals.optim_fit <- function(object, ...) {
+  object$residuals
+}
+
+
+#' @export
+print.optim_fit <- function(x, ...) {
+  cat("General-optimisation fit (optim_fit)\n")
+  cat("===================================\n")
+  cat("Expression:", x$expression, "\n")
+  cat("Response:  ", x$target, "\n")
+  cat("Coefficients:\n")
+  print(x$coefficients)
+  cat(sprintf("Objective: %.6g | convergence code: %d\n",
+              x$value, x$convergence))
+  if (!is.null(x$message) && nzchar(x$message)) {
+    cat("Message:", x$message, "\n")
+  }
+  invisible(x)
+}
+
+
+#' Turn the Fitted Constants of a Discovered Equation into Free Parameters
+#'
+#' A symbolic search returns its equations with the constants already fitted, as
+#' numeric literals: \code{"(x * x) * 3.9305"}. Anything that has to re-estimate
+#' the equation on a subsample -- cross-validation fold by fold, a bootstrap
+#' replicate -- needs those constants back as free parameters, together with
+#' starting values. This function performs that conversion: every numeric
+#' literal becomes a named parameter and the literal itself becomes its starting
+#' value, which is the best possible warm start because it is the optimum the
+#' search already found on the full sample.
+#'
+#' The expression is taken apart with \R's own parser and rebuilt from its
+#' syntax tree, never by textual substitution: a regular expression cannot tell
+#' the \code{3} of a coefficient from the \code{3} inside a variable named
+#' \code{Z3}.
+#'
+#' @param expression Character string with the equation, or a
+#'   \code{symbolic_equation} object (its expression is used).
+#' @param data Optional data frame. When supplied, its column names are avoided
+#'   when naming the new parameters, so that a parameter can never collide with
+#'   a variable.
+#' @param prefix Prefix for the generated parameter names.
+#' @param protect_exponents Logical. When \code{TRUE} (the default), an integer
+#'   exponent of \code{^} is left alone: it is part of the structure the search
+#'   proposed, not a constant it fitted, and turning it into a free parameter
+#'   would let a comparison between structures move between them.
+#'
+#' @return A list with
+#'   \item{expression}{The parameterised expression, as a character string.}
+#'   \item{start}{Named list of starting values, one per generated parameter.}
+#'   \item{n_parameters}{Number of parameters generated.}
+#'   An expression carrying no numeric literal is returned unchanged, with an
+#'   empty \code{start} and \code{n_parameters = 0}; that is not an error, it
+#'   simply means there is nothing to re-estimate.
+#'
+#' @examples
+#' # A constant already fitted by the search becomes a free parameter
+#' parameterize_equation("(x * x) * 3.9305288261198923")
+#'
+#' # Digits inside a variable name are not constants
+#' parameterize_equation("(4.07 * sinX) - Z3")
+#'
+#' # Nothing to estimate: returned unchanged
+#' parameterize_equation("YmX")
+#'
+#' @seealso \code{\link{fit_specified_equation}}, \code{\link{cross_validate}}
+#' @export
+parameterize_equation <- function(expression, data = NULL, prefix = "c",
+                                  protect_exponents = TRUE) {
+
+  if (inherits(expression, "symbolic_equation")) {
+    expression <- if (!is.null(expression$expression)) {
+      expression$expression
+    } else {
+      expression$string
+    }
+  }
+  if (!is.character(expression) || length(expression) != 1L || is.na(expression)) {
+    stop("'expression' must be a single character string or a symbolic_equation.",
+         call. = FALSE)
+  }
+  if (!is.character(prefix) || length(prefix) != 1L || !nzchar(prefix)) {
+    stop("'prefix' must be a single non-empty character string.", call. = FALSE)
+  }
+
+  parsed <- tryCatch(parse(text = expression)[[1]],
+                     error = function(e) {
+                       stop("Could not parse 'expression': ", conditionMessage(e),
+                            call. = FALSE)
+                     })
+
+  # Names that are already spoken for: everything the expression mentions plus
+  # every column of the data the equation will be fitted against.
+  taken <- unique(c(all.vars(parsed), names(data)))
+  counter <- 0L
+  values <- list()
+
+  next_name <- function() {
+    repeat {
+      counter <<- counter + 1L
+      nm <- paste0(prefix, counter)
+      if (!nm %in% taken) return(nm)
+    }
+  }
+
+  take_literal <- function(value) {
+    nm <- next_name()
+    values[[nm]] <<- as.numeric(value)
+    as.name(nm)
+  }
+
+  is_literal <- function(node) {
+    is.numeric(node) && length(node) == 1L
+  }
+
+  walk <- function(node) {
+    if (is_literal(node)) return(take_literal(node))
+    if (!is.call(node)) return(node)
+
+    head_sym <- node[[1]]
+
+    # A unary minus in front of a literal is the literal's sign, not an
+    # operation on a parameter: -0.049 yields one parameter starting at -0.049,
+    # so that the reported coefficient keeps its natural sign.
+    if (identical(head_sym, as.name("-")) && length(node) == 2L &&
+        is_literal(node[[2]])) {
+      return(take_literal(-as.numeric(node[[2]])))
+    }
+    if (identical(head_sym, as.name("+")) && length(node) == 2L &&
+        is_literal(node[[2]])) {
+      return(take_literal(as.numeric(node[[2]])))
+    }
+
+    # An integer exponent is structure, not a fitted constant.
+    if (protect_exponents && identical(head_sym, as.name("^")) &&
+        length(node) == 3L && is_literal(node[[3]]) &&
+        is.finite(node[[3]]) && node[[3]] == round(node[[3]])) {
+      node[[2]] <- walk(node[[2]])
+      return(node)
+    }
+
+    for (i in seq_along(node)[-1]) {
+      arg <- node[[i]]
+      if (missing(arg)) next
+      node[[i]] <- walk(arg)
+    }
+    node
+  }
+
+  rebuilt <- walk(parsed)
+
+  list(
+    expression = paste(deparse(rebuilt), collapse = " "),
+    start = values,
+    n_parameters = length(values)
   )
 }
 
@@ -1560,18 +1774,42 @@ coef.symbolic_equation <- function(object, ...) {
 #' @export
 predict.symbolic_equation <- function(object, newdata = NULL, ...) {
   if (!is.null(object$fit)) {
-    stats::predict(object$fit, newdata = newdata, ...)
-  } else if (!is.null(object$expression) && !is.null(object$coefficients)) {
-    # Evaluate expression with coefficients
-    env <- create_eval_env(newdata, as.list(object$coefficients))
-    eval(parse(text = object$expression), envir = env)
-  } else if (!is.null(object$expr)) {
-    warning("Direct expression evaluation not yet implemented for prediction")
-    NULL
-  } else {
-    warning("Cannot predict without fitted model or expression")
-    NULL
+    return(stats::predict(object$fit, newdata = newdata, ...))
   }
+
+  # An equation that came out of a search carries its constants as literals and
+  # therefore has no coefficients to supply. It is still fully evaluable, and
+  # refusing to evaluate it was what left every discovered equation unable to
+  # predict.
+  expression <- if (!is.null(object$expression)) {
+    object$expression
+  } else {
+    object$string
+  }
+
+  if (is.null(expression)) {
+    warning("Cannot predict without fitted model or expression")
+    return(NULL)
+  }
+
+  if (is.null(newdata)) {
+    warning("Cannot predict without 'newdata' for an equation that carries no fit")
+    return(NULL)
+  }
+
+  newdata <- as.data.frame(newdata)
+  coefs <- object$coefficients
+  env <- create_eval_env(newdata,
+                         if (is.null(coefs)) list() else as.list(coefs))
+
+  out <- tryCatch(eval(parse(text = expression), envir = env),
+                  error = function(e) {
+                    warning("The equation could not be evaluated: ",
+                            conditionMessage(e))
+                    NULL
+                  })
+  if (is.null(out)) return(NULL)
+  rep_len(as.numeric(out), nrow(newdata))
 }
 
 

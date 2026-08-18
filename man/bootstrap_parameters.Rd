@@ -11,7 +11,8 @@ bootstrap_parameters(
   derivative_col = NULL,
   n_boot = 500,
   conf_level = 0.95,
-  block_size = NULL
+  block_size = NULL,
+  weights = NULL
 )
 }
 \arguments{
@@ -28,10 +29,19 @@ bootstrap_parameters(
 \item{conf_level}{Confidence level (default 0.95).}
 
 \item{block_size}{Block size for block bootstrap (time series).}
+
+\item{weights}{Optional vector of observation weights, one per row of
+\code{data}.}
 }
 \value{
 Data frame with parameter estimates and confidence intervals.
 }
 \description{
 Computes bootstrap confidence intervals for equation parameters.
+}
+\details{
+A discovered equation carries its constants as literals and has no
+coefficients to resample. It is therefore parameterised first, exactly as
+in \code{\link{cross_validate}}, and what is resampled are the parameters
+that stand in for those literals.
 }

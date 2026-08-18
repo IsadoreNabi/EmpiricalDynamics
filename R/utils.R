@@ -214,11 +214,25 @@ extract_formula_vars <- function(formula) {
 }
 
 
+#' Square and Reciprocal (Internal)
+#'
+#' The genetic search writes equations with \code{square()} and \code{inv()},
+#' which are not \R functions. They are defined here, in the package namespace,
+#' so that they resolve wherever such an equation is evaluated -- including
+#' inside \code{nls()} and \code{nlsLM()}, which evaluate the model formula in
+#' its own environment and never see \code{create_eval_env()}.
+#' @noRd
+square <- function(x) x^2
+
+#' @noRd
+inv <- function(x) 1/x
+
+
 #' Create Safe Evaluation Environment (Internal)
 #' @noRd
 create_eval_env <- function(data, params = list()) {
   env <- new.env(parent = baseenv())
-  
+
   # Add mathematical functions
   env$exp <- base::exp
   env$log <- base::log
@@ -228,8 +242,8 @@ create_eval_env <- function(data, params = list()) {
   env$tan <- base::tan
   env$abs <- base::abs
   env$sign <- base::sign
-  env$inv <- function(x) 1/x
-  env$square <- function(x) x^2
+  env$inv <- inv
+  env$square <- square
   env$logistic <- function(x, k = 1, x0 = 0) 1 / (1 + base::exp(-k * (x - x0)))
   env$threshold <- function(x, c) ifelse(x > c, 1, 0)
   env$softplus <- function(x) base::log(1 + base::exp(x))

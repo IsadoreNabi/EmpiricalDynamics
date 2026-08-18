@@ -825,6 +825,134 @@ end
 
 get_version() = "0.1.1"
 
+"""
+    ed_refit_constants(expr_str, X_train, y_train, X_test, var_names; kwargs...)
+
+Re-estimate the constants of an already-discovered equation on `X_train`/`y_train`
+and predict on `X_test`, **with the very optimiser and the very loss the search
+itself used**: the expression is parsed back into a SymbolicRegression.jl tree and
+handed to that package's own constant optimisation, so nothing here is a
+reimplementation of it.
+
+`X_train` and `X_test` are (n_features, n_rows) matrices, matching the layout the
+search is given. `weights` are the observation weights of the training rows.
+
+Returns a NamedTuple with `ok`, `message`, `constants`, `n_constants`,
+`predictions` (on `X_test`) and `expression` (the refitted equation as a string).
+"""
+function ed_refit_constants(
+    expr_str::String,
+    X_train::AbstractMatrix,
+    y_train::AbstractVector,
+    X_test::AbstractMatrix,
+    var_names::Vector{String};
+    weights = nothing,
+    binary_operators = [+, -, *, /],
+    unary_operators = [sin, cos, exp, log, sqrt, abs],
+    optimizer_iterations = 500,
+    optimizer_nrestarts = 8,
+)
+    empty = Float64[]
+    try
+        # The optimiser and the loss are the search's own. The *budget* is not:
+        # inside a search the constants are re-optimised on every candidate of
+        # every generation, so the default is deliberately cheap -- eight BFGS
+        # iterations and two restarts -- and it stops well short of the optimum.
+        # A refit happens once and is asked for the constants that actually
+        # minimise the loss, so it is given a budget to reach them.
+        options = SymbolicRegression.Options(
+            binary_operators = Tuple(binary_operators),
+            unary_operators = Tuple(unary_operators),
+            should_optimize_constants = true,
+            optimizer_iterations = optimizer_iterations,
+            optimizer_nrestarts = optimizer_nrestarts,
+            deterministic = false,
+            progress = false,
+            verbosity = 0,
+        )
+
+        tree = SymbolicRegression.parse_expression(
+            Meta.parse(expr_str);
+            operators = options.operators,
+            variable_names = var_names,
+            node_type = Node{Float64},
+        )
+
+        consts, _ = SymbolicRegression.get_scalar_constants(tree)
+        # Handed back so that the caller can check its own ordering of the
+        # constants against this one instead of assuming they agree.
+        initial_consts = Vector{Float64}(consts)
+
+        Xtr_all = Matrix{Float64}(X_train)
+        ytr_all = Vector{Float64}(y_train)
+        wts = weights === nothing ? ones(length(ytr_all)) : Vector{Float64}(weights)
+        train_loss = function (t)
+            p, good = SymbolicRegression.eval_tree_array(t, Xtr_all)
+            (!good || any(!isfinite, p)) && return Inf
+            sum(wts .* (ytr_all .- p) .^ 2)
+        end
+        loss_before = train_loss(tree)
+
+        if !isempty(consts)
+            Xtr = Matrix{Float64}(X_train)
+            ytr = Vector{Float64}(y_train)
+            dataset = if weights === nothing
+                SymbolicRegression.Dataset(Xtr, ytr; variable_names = var_names)
+            else
+                SymbolicRegression.Dataset(Xtr, ytr;
+                                           weights = Vector{Float64}(weights),
+                                           variable_names = var_names)
+            end
+            # `PopMember` refuses to guess `deterministic`, so it is stated.
+            member = SymbolicRegression.PopMember(dataset, tree, options;
+                                                  deterministic = false)
+            optimised = SymbolicRegression.ConstantOptimizationModule.optimize_constants(
+                dataset, member, options)
+            new_member = optimised isa Tuple ? optimised[1] : optimised
+            tree = new_member.tree
+        end
+
+        preds, ok = SymbolicRegression.eval_tree_array(tree, Matrix{Float64}(X_test))
+        if !ok
+            return (ok = false,
+                    message = "the equation could not be evaluated on the test rows",
+                    constants = empty, constants_initial = initial_consts,
+                    n_constants = length(consts),
+                    predictions = empty, expression = expr_str,
+                    loss_before = loss_before, loss_after = loss_before,
+                    moved = false)
+        end
+
+        final_consts, _ = SymbolicRegression.get_scalar_constants(tree)
+        loss_after = train_loss(tree)
+
+        # Whether the optimiser actually went anywhere. It does not always: the
+        # restarts perturb the constants multiplicatively, so a constant the
+        # search left at zero stays at zero, and a kink there -- `abs(c)` with
+        # c ~ 0 -- is a point it cannot leave at any budget. That is a property
+        # of the search's optimiser, and the honest thing is to report it rather
+        # than to nudge the starting point behind the caller's back.
+        moved = !isempty(consts) && loss_after < loss_before * (1 - 1e-12)
+
+        return (ok = true,
+                message = "",
+                constants = Vector{Float64}(final_consts),
+                constants_initial = initial_consts,
+                n_constants = length(final_consts),
+                predictions = Vector{Float64}(preds),
+                expression = string(tree),
+                loss_before = loss_before,
+                loss_after = loss_after,
+                moved = moved)
+    catch e
+        return (ok = false,
+                message = sprint(showerror, e),
+                constants = empty, constants_initial = empty, n_constants = 0,
+                predictions = empty, expression = expr_str,
+                loss_before = NaN, loss_after = NaN, moved = false)
+    end
+end
+
 function get_available_operators()
     return Dict(
         :binary => Dict(
@@ -880,6 +1008,9 @@ if abspath(PROGRAM_FILE) == @__FILE__
         
         i = 4
         while i <= length(ARGS)
+            # These already are globals; saying so keeps Julia from warning
+            # about ambiguous soft scope every time the file is loaded.
+            global max_complexity, n_iterations, parsimony, output_path, do_warmup, i
             if ARGS[i] == "--complexity" && i < length(ARGS)
                 max_complexity = parse(Int, ARGS[i+1])
                 i += 2

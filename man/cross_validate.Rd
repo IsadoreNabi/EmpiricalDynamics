@@ -15,6 +15,8 @@ cross_validate(
   horizon = 1,
   refit_derivative = FALSE,
   diff_method = "tvr",
+  weights = NULL,
+  refit_engine = c("r", "julia"),
   verbose = TRUE
 )
 }
@@ -40,6 +42,18 @@ cross_validate(
 
 \item{diff_method}{Differentiation method if refitting (currently unused).}
 
+\item{weights}{Optional vector of observation weights, one per row of
+\code{data}. Each fold is refitted with the weights of its own training
+rows, so that a search run under weights is validated under them too.}
+
+\item{refit_engine}{Which engine re-estimates the constants on each training
+fold: \code{"r"} (the default) uses this package's nonlinear least squares;
+\code{"julia"} hands the equation to SymbolicRegression.jl's own constant
+optimisation, which is the optimiser and the loss the search itself used,
+and requires Julia and the \code{JuliaCall} package. The default is
+\code{"r"} so that the figure a given equation gets does not depend on
+what happens to be installed on the machine.}
+
 \item{verbose}{Print progress.}
 }
 \value{
@@ -51,10 +65,29 @@ Object of class "cv_result" containing:
 \item{sd_rmse}{Standard deviation of RMSE}
 \item{predictions}{List of predicted vs actual per fold}
 \item{fold_indices}{Indices used for each fold}
+\item{refitted}{Whether the equation was re-estimated on each fold}
+\item{parameterization}{The parameterised expression that was refitted, when
+the equation was a discovered one, and \code{NULL} otherwise}
+\item{refit_engine}{The engine that did the refitting}
+\item{stalled_folds}{Folds in which the Julia optimiser did not move off
+its starting constants, so the error reported for them is that of the
+equation as the search left it. Empty for the R engine.}
 }
 \description{
 Performs k-fold or block cross-validation to assess out-of-sample predictive
 performance of the discovered equation.
+}
+\details{
+A discovered equation arrives with its constants already fitted, as
+numeric literals, and there is nothing in it left to estimate. Before the
+folds begin, such an equation is passed through
+\code{\link{parameterize_equation}}: its literals become free parameters
+starting at the values the search found, and each fold re-estimates them on
+its own training rows. An equation specified by the user, which already has
+named free parameters, keeps taking its starting values from its own
+coefficients. An equation with no constants at all is not refitted -- there
+is nothing to refit -- and is scored by evaluating it on the held-out rows;
+the returned object says so in \code{refitted}.
 }
 \examples{
 \donttest{

@@ -139,26 +139,37 @@ test_that("construct_sde creates valid SDE object", {
   expect_true("variable" %in% names(sde))
 })
 
-test_that("estimate_sde_iterative converges", {
-  testthat::skip_if_not(exists("estimate_sde_iterative"), "estimate_sde_iterative not found")
+test_that("estimate_sde_iterative runs and returns an SDE model", {
   testthat::skip_if_not_installed("minpack.lm")
-  
-  # We use tryCatch to avoid failing the check if convergence isn't reached perfectly
-  sde <- tryCatch(
-    estimate_sde_iterative(
-      drift_formula = "a + b * Z",
-      data = test_data,
-      derivative_col = "dZ",
-      max_iter = 5,
-      tolerance = 0.1
-    ),
-    error = function(e) NULL
-  )
-  
-  testthat::skip_if(is.null(sde), "estimate_sde_iterative failed")
-  
+  testthat::skip_on_cran()
+  testthat::skip_if(is.null(test_eq), "Test equation could not be fitted")
+
+  # This used to be called with `drift_formula`, `derivative_col` and
+  # `tolerance`, none of which the function has: the call raised an error, the
+  # error was swallowed and the test skipped itself on every run without ever
+  # touching the code it names. The arguments below are the ones the function
+  # actually takes; the initial drift is supplied so that the iteration starts
+  # from a known fit rather than from a search.
+  # The warnings this emits on such a short toy series -- NaNs from a drift the
+  # search proposed with a square root, and the iteration limit -- are the
+  # algorithm reporting on the data, not defects; what is under test here is
+  # that the function completes and hands back the object it promises.
+  sde <- suppressWarnings(estimate_sde_iterative(
+    target = test_data$dZ,
+    predictors = test_data[, c("Z", "X"), drop = FALSE],
+    data = test_data,
+    initial_drift = test_eq,
+    max_iter = 2,
+    tol = 0.1,
+    Z = test_data$Z,
+    t = test_data$time
+  ))
+
   expect_s3_class(sde, "sde_model")
-  expect_true(sde$converged || sde$iterations <= 5)
+  expect_true(all(c("drift", "diffusion", "n_iterations", "converged") %in%
+                    names(sde)))
+  expect_true(is.logical(sde$converged))
+  expect_true(sde$n_iterations <= 2)
 })
 
 # -----------------------------------------------------------------------------
