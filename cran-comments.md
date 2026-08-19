@@ -1,6 +1,7 @@
 ## Submission of EmpiricalDynamics 0.1.9 (bug-fix release)
 
-This is a patch release. It repairs the qualitative-analysis pair
+CRAN currently hosts 0.1.5; NEWS.md documents every change since, version
+by version. This is a patch release. It repairs the qualitative-analysis pair
 `analyze_fixed_points()` / `analyze_bifurcations()`, whose `lm`/`glm` path
 evaluated the bare formula terms with the fitted coefficients effectively set
 to 1, and whose bifurcation sweep accepted a parameter absent from the
