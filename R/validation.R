@@ -865,71 +865,230 @@ compare_trajectories <- function(simulation, observed_data,
 # QUALITATIVE VALIDATION
 # =============================================================================
 
-#' Analyze Fixed Points
-#'
-#' Finds and characterizes fixed points of the discovered equation.
-#'
-#' @param equation Fitted equation object.
-#' @param variable Name of the main variable.
-#' @param range Numeric vector of length 2 specifying search range.
-#' @param n_grid Number of grid points for initial search.
-#' @param exogenous_values Named list of fixed values for exogenous variables.
-#'
-#' @return Data frame of fixed points with stability classification.
-#' @examples
-#' \donttest{
-#' # Toy example: dZ = 2*Z - Z^2 (Logistic growth)
-#' data <- data.frame(Z = seq(0.1, 3, length.out=50))
-#' data$dZ <- 2*data$Z - data$Z^2
-#' model <- stats::lm(dZ ~ I(Z) + I(Z^2) + 0, data = data)
-#'
-#' # Analyze (note: linear models on dZ aren't direct ODEs, but this demonstrates structure)
-#' # For correct usage, 'equation' should be from fit_specified_equation
-#' fp <- analyze_fixed_points(model, variable = "Z", range = c(0, 3))
-#' }
-#' @export
-analyze_fixed_points <- function(equation, variable, 
-                                 range = c(-10, 10),
-                                 n_grid = 100,
-                                 exogenous_values = list()) {
-  
-  # Extract expression
+# Extract the pieces every qualitative routine needs from a fitted equation:
+# how it must be evaluated, which symbols it consults, and which coefficients
+# it carries. "expression" equations (symbolic_equation, nls) evaluate their
+# formula text in an environment; "model" equations (lm, and glm through
+# inheritance) must be evaluated by their own predict() machinery, because
+# their coefficient names -- "I(Z)", "(Intercept)", factor contrasts -- are
+# term labels, not symbols of the formula text, and injecting them into an
+# evaluation environment binds nothing the expression ever consults.
+ed_equation_pieces <- function(equation) {
   if (inherits(equation, "symbolic_equation")) {
     expr_str <- if (!is.null(equation$expression)) {
       equation$expression
     } else {
       equation$string
     }
-    coefs <- stats::coef(equation)
-  } else if (inherits(equation, "nls") || inherits(equation, "lm")) {
-    expr_str <- deparse(stats::formula(equation)[[3]])
-    coefs <- stats::coef(equation)
+    list(kind = "expression", expr_str = expr_str,
+         symbols = all.vars(str2lang(expr_str)),
+         coefs = stats::coef(equation))
+  } else if (inherits(equation, "nls")) {
+    # nls parameter names are genuine symbols of its formula, so the
+    # expression path is exact for it.
+    expr_str <- paste(deparse(stats::formula(equation)[[3]]), collapse = " ")
+    list(kind = "expression", expr_str = expr_str,
+         symbols = all.vars(str2lang(expr_str)),
+         coefs = stats::coef(equation))
+  } else if (inherits(equation, "lm")) {
+    trm <- stats::delete.response(stats::terms(equation))
+    list(kind = "model", expr_str = NULL,
+         symbols = all.vars(trm),
+         coefs = stats::coef(equation))
   } else {
-    stop("Unknown equation type")
+    stop("Unknown equation type: expected a 'symbolic_equation', 'nls', ",
+         "'lm' or 'glm' object, got ",
+         paste(class(equation), collapse = "/"), call. = FALSE)
   }
-  
-  # Create evaluation function
-  eval_env <- new.env()
-  if (!is.null(coefs)) {
-    for (nm in names(coefs)) {
-      eval_env[[nm]] <- coefs[nm]
+}
+
+# A declared value that carries no name binds nothing: names(x) is NULL and
+# the injection loop runs zero times, silently. Refuse that up front.
+ed_check_named_list <- function(x, what) {
+  if (length(x) == 0L) return(invisible(NULL))
+  nms <- names(x)
+  if (is.null(nms) || any(!nzchar(nms))) {
+    stop("every element of '", what, "' must be named: an unnamed value ",
+         "cannot bind to any symbol of the equation and would be ignored ",
+         "silently", call. = FALSE)
+  }
+  if (anyDuplicated(nms)) {
+    stop("'", what, "' declares the name '",
+         nms[anyDuplicated(nms)], "' more than once", call. = FALSE)
+  }
+  invisible(NULL)
+}
+
+#' Analyze Fixed Points
+#'
+#' Finds and characterizes fixed points of the discovered equation.
+#'
+#' For \code{lm} and \code{glm} equations the right-hand side is evaluated
+#' through the model's own \code{predict()} machinery (on the response scale
+#' for \code{glm}), so the fitted coefficients enter exactly as fitted --
+#' \code{I()} terms, factors and link functions included. For
+#' \code{symbolic_equation} and \code{nls} equations the expression is
+#' evaluated with the fitted coefficients bound by name.
+#'
+#' Every name consulted by the equation must be accounted for: the search
+#' \code{variable}, a fitted coefficient, or a value declared in
+#' \code{exogenous_values}. A free symbol without a value, an unnamed
+#' declaration, a declaration that collides with the search variable or with
+#' a fitted coefficient -- each of these is reported instead of being
+#' silently ignored or silently overwriting the fit. To vary a fitted
+#' coefficient deliberately, use \code{coefficient_values}.
+#'
+#' @param equation Fitted equation object (\code{symbolic_equation},
+#'   \code{nls}, \code{lm} or \code{glm}).
+#' @param variable Name of the main variable.
+#' @param range Numeric vector of length 2 specifying search range.
+#' @param n_grid Number of grid points for initial search.
+#' @param exogenous_values Named list of fixed values for exogenous variables.
+#' @param coefficient_values Named list of deliberate overrides for fitted
+#'   coefficients; every name must match a fitted coefficient.
+#'
+#' @return Data frame of fixed points with stability classification. The
+#'   values any exogenous variables were held at travel with the result as
+#'   its \code{"exogenous_values"} attribute, because a fixed point found
+#'   under fixed exogenous values is conditional on that fixing.
+#' @examples
+#' # dZ = 2*Z - Z^2: fixed points at 0 (unstable, f' = +2)
+#' #                            and at 2 (stable,   f' = -2)
+#' data <- data.frame(Z = seq(0.1, 3, length.out = 50))
+#' data$dZ <- 2 * data$Z - data$Z^2
+#' model <- stats::lm(dZ ~ I(Z) + I(Z^2) + 0, data = data)
+#' analyze_fixed_points(model, variable = "Z", range = c(-1, 3))
+#' @export
+analyze_fixed_points <- function(equation, variable,
+                                 range = c(-10, 10),
+                                 n_grid = 100,
+                                 exogenous_values = list(),
+                                 coefficient_values = list()) {
+
+  if (!is.character(variable) || length(variable) != 1L || !nzchar(variable)) {
+    stop("'variable' must be a single variable name", call. = FALSE)
+  }
+  if (!is.numeric(range) || length(range) != 2L || !all(is.finite(range)) ||
+      range[1] >= range[2]) {
+    stop("'range' must be two finite numbers in increasing order",
+         call. = FALSE)
+  }
+  ed_check_named_list(exogenous_values, "exogenous_values")
+  ed_check_named_list(coefficient_values, "coefficient_values")
+
+  pieces <- ed_equation_pieces(equation)
+  coefs <- pieces$coefs
+
+  if (variable %in% names(exogenous_values)) {
+    stop("'exogenous_values' declares the search variable '", variable,
+         "': the declared value would be overwritten at every grid point ",
+         "and bind nothing", call. = FALSE)
+  }
+  if (!(variable %in% pieces$symbols)) {
+    stop("variable '", variable, "' does not appear in the equation ",
+         "(its variables are: ", paste(pieces$symbols, collapse = ", "),
+         "); the equation would be constant in it", call. = FALSE)
+  }
+  if (length(coefficient_values)) {
+    unknown <- setdiff(names(coefficient_values), names(coefs))
+    if (length(unknown)) {
+      stop("'coefficient_values' names ",
+           paste0("'", unknown, "'", collapse = ", "),
+           " which are not fitted coefficients of this equation ",
+           "(fitted: ", paste(names(coefs), collapse = ", "), ")",
+           call. = FALSE)
     }
   }
-  for (nm in names(exogenous_values)) {
-    eval_env[[nm]] <- exogenous_values[[nm]]
+  unused <- setdiff(names(exogenous_values), pieces$symbols)
+  if (length(unused)) {
+    warning("'exogenous_values' declares ",
+            paste0("'", unused, "'", collapse = ", "),
+            ", which the equation never consults: the declaration has ",
+            "no effect", call. = FALSE)
   }
-  
-  f <- function(z) {
-    eval_env[[variable]] <- z
-    tryCatch(
-      eval(parse(text = expr_str), envir = eval_env),
-      error = function(e) NA
-    )
+
+  if (pieces$kind == "model") {
+    # lm / glm: evaluate through the model's own prediction machinery.
+    needed <- setdiff(pieces$symbols, c(variable, names(exogenous_values)))
+    if (length(needed)) {
+      stop("the model consults ",
+           paste0("'", needed, "'", collapse = ", "),
+           " but no value was declared for ",
+           if (length(needed) == 1L) "it" else "them",
+           ": pass fixed values through 'exogenous_values'", call. = FALSE)
+    }
+    if (length(coefficient_values)) {
+      for (nm in names(coefficient_values)) {
+        equation$coefficients[nm] <- as.numeric(coefficient_values[[nm]])
+      }
+    }
+    is_glm <- inherits(equation, "glm")
+    f_vec <- function(z) {
+      nd <- stats::setNames(data.frame(z = z), variable)
+      for (nm in names(exogenous_values)) {
+        nd[[nm]] <- exogenous_values[[nm]]
+      }
+      tryCatch({
+        if (is_glm) {
+          as.numeric(stats::predict(equation, newdata = nd,
+                                    type = "response"))
+        } else {
+          as.numeric(stats::predict(equation, newdata = nd))
+        }
+      }, error = function(e) rep(NA_real_, length(z)))
+    }
+    f <- function(z) f_vec(z)
+  } else {
+    expr_str <- pieces$expr_str
+    clash <- intersect(names(exogenous_values), names(coefs))
+    if (length(clash)) {
+      stop("'exogenous_values' declares ",
+           paste0("'", clash, "'", collapse = ", "),
+           ", which ", if (length(clash) == 1L) "is a" else "are",
+           " fitted coefficient", if (length(clash) == 1L) "" else "s",
+           " of the equation: the declaration would silently overwrite ",
+           "the fit. To vary a fitted coefficient deliberately, use ",
+           "'coefficient_values'", call. = FALSE)
+    }
+    if (length(coefficient_values)) {
+      for (nm in names(coefficient_values)) {
+        coefs[nm] <- as.numeric(coefficient_values[[nm]])
+      }
+    }
+    known <- c(variable, names(coefs), names(exogenous_values))
+    free <- setdiff(pieces$symbols, known)
+    free <- free[!vapply(free, exists, logical(1), envir = baseenv())]
+    if (length(free)) {
+      stop("the equation consults ",
+           paste0("'", free, "'", collapse = ", "),
+           " but no value was declared for ",
+           if (length(free) == 1L) "it" else "them",
+           ": pass fixed values through 'exogenous_values'", call. = FALSE)
+    }
+
+    eval_env <- new.env()
+    if (!is.null(coefs)) {
+      for (nm in names(coefs)) {
+        eval_env[[nm]] <- coefs[nm]
+      }
+    }
+    for (nm in names(exogenous_values)) {
+      eval_env[[nm]] <- exogenous_values[[nm]]
+    }
+
+    f <- function(z) {
+      eval_env[[variable]] <- z
+      tryCatch(
+        eval(parse(text = expr_str), envir = eval_env),
+        error = function(e) NA
+      )
+    }
+    f_vec <- function(z) sapply(z, f)
   }
-  
+
   # Grid search for sign changes
   grid <- seq(range[1], range[2], length.out = n_grid)
-  f_vals <- sapply(grid, f)
+  f_vals <- f_vec(grid)
   
   # Find sign changes
   valid_idx <- which(!is.na(f_vals))
@@ -942,21 +1101,35 @@ analyze_fixed_points <- function(equation, variable,
     ))
   }
   
-  sign_changes <- which(diff(sign(f_vals[valid_idx])) != 0)
-  
-  fixed_points <- numeric(0)
-  
-  for (i in sign_changes) {
+  # A grid point that lands exactly on a root has sign 0. Counting it
+  # through diff(sign(...)) != 0 counted the same crossing twice -- once
+  # into the zero and once out of it -- and uniroot then refined the same
+  # root from both adjacent brackets, so it appeared twice in the output.
+  # An exact zero is a root in its own right; a crossing is a strict sign
+  # flip between consecutive evaluable grid points.
+  s <- sign(f_vals[valid_idx])
+  fixed_points <- grid[valid_idx][s == 0]
+
+  strict_flips <- which(s[-length(s)] * s[-1] < 0)
+  for (i in strict_flips) {
     idx1 <- valid_idx[i]
     idx2 <- valid_idx[i + 1]
     # Refine with uniroot
     fp <- tryCatch({
       stats::uniroot(f, c(grid[idx1], grid[idx2]))$root
     }, error = function(e) NA)
-    
+
     if (!is.na(fp)) {
       fixed_points <- c(fixed_points, fp)
     }
+  }
+
+  # Two detections closer than half a grid step are the same root seen
+  # twice: the grid cannot resolve distinct roots below its own spacing.
+  if (length(fixed_points) > 1) {
+    fixed_points <- sort(fixed_points)
+    step <- (range[2] - range[1]) / (n_grid - 1)
+    fixed_points <- fixed_points[c(TRUE, diff(fixed_points) > step / 2)]
   }
   
   if (length(fixed_points) == 0) {
@@ -999,7 +1172,12 @@ analyze_fixed_points <- function(equation, variable,
     stability = stability,
     eigenvalue = eigenvalues
   )
-  
+
+  # A fixed point found with exogenous variables held fixed is conditional
+  # on that fixing: the declaration travels with the result.
+  attr(result, "variable") <- variable
+  attr(result, "exogenous_values") <- exogenous_values
+  attr(result, "coefficient_values") <- coefficient_values
   return(result)
 }
 
@@ -1007,56 +1185,213 @@ analyze_fixed_points <- function(equation, variable,
 #'
 #' Examines how fixed points change as a parameter varies.
 #'
+#' The parameter must actually appear in the equation, and is varied
+#' according to what it is: a fitted coefficient is overridden through
+#' \code{coefficient_values} of \code{\link{analyze_fixed_points}}, and a
+#' free variable of the expression is bound through
+#' \code{exogenous_values}. A name that is neither is an error -- sweeping
+#' it would evaluate the same equation \code{n_param} times and label the
+#' identical copies with the parameter's name.
+#'
+#' When one name could denote both: for \code{lm}/\code{glm} equations a
+#' plain term's coefficient label coincides with the variable's name, and
+#' the name is taken as the variable (labels that are never variables, like
+#' \code{"I(Z)"}, denote their coefficient); for \code{nls} and
+#' \code{symbolic_equation} equations a coefficient name is a symbol of the
+#' formula itself and is taken as the coefficient.
+#'
 #' @param equation Fitted equation object.
 #' @param variable Name of the main variable.
-#' @param parameter Name of the parameter to vary.
+#' @param parameter Name of the parameter to vary. Must be a fitted
+#'   coefficient or a variable of the equation, and must differ from
+#'   \code{variable}.
 #' @param param_range Range for parameter values.
 #' @param n_param Number of parameter values to test.
 #' @param z_range Range for searching fixed points.
 #' @param exogenous_values Fixed values for other variables.
 #'
-#' @return Object of class "bifurcation_analysis".
+#' @return Object of class "bifurcation_analysis". \code{$data} holds the
+#'   fixed points found; \code{$status} holds one row per requested
+#'   parameter value -- \code{"ok"}, \code{"no_fixed_points"} or
+#'   \code{"error"} with the error's message -- so the requested grid can
+#'   always be reconstructed and a failure is never mistaken for an
+#'   absence; \code{$mode} records whether the parameter was varied as a
+#'   \code{"coefficient"} or as an \code{"exogenous"} variable.
+#' @examples
+#' # dZ = r*Z - Z^2: transcritical bifurcation at r = 0
+#' set.seed(1)
+#' data <- data.frame(Z = seq(-1, 3, length.out = 80))
+#' data$dZ <- 2 * data$Z - data$Z^2 + 0.01 * stats::rnorm(80)
+#' fit <- stats::nls(dZ ~ r * Z - Z^2, data = data, start = list(r = 1))
+#' bif <- analyze_bifurcations(fit, variable = "Z", parameter = "r",
+#'                             param_range = c(-1, 1), n_param = 11,
+#'                             z_range = c(-3, 3))
+#' print(bif)
 #' @export
 analyze_bifurcations <- function(equation, variable, parameter,
                                  param_range = c(-5, 5),
                                  n_param = 50,
                                  z_range = c(-10, 10),
                                  exogenous_values = list()) {
-  
+
+  if (!is.character(parameter) || length(parameter) != 1L ||
+      !nzchar(parameter)) {
+    stop("'parameter' must be a single name", call. = FALSE)
+  }
+  if (identical(parameter, variable)) {
+    stop("'parameter' and 'variable' are both '", variable,
+         "': the bifurcation parameter cannot be the variable whose ",
+         "fixed points are being tracked", call. = FALSE)
+  }
+  ed_check_named_list(exogenous_values, "exogenous_values")
+  if (parameter %in% names(exogenous_values)) {
+    stop("'exogenous_values' already fixes '", parameter,
+         "', the parameter being varied", call. = FALSE)
+  }
+
+  pieces <- ed_equation_pieces(equation)
+  # For an lm/glm a plain term's coefficient label coincides with the
+  # variable's own name; there the name denotes the variable, and labels
+  # that are never variables -- "I(Z)", "(Intercept)" -- denote their
+  # coefficient. For an expression (nls, symbolic_equation) a coefficient
+  # name is a genuine symbol of the formula and denotes the coefficient.
+  candidates <- if (pieces$kind == "model") {
+    list(exogenous = pieces$symbols, coefficient = names(pieces$coefs))
+  } else {
+    list(coefficient = names(pieces$coefs), exogenous = pieces$symbols)
+  }
+  mode <- if (parameter %in% candidates[[1L]]) {
+    names(candidates)[1L]
+  } else if (parameter %in% candidates[[2L]]) {
+    names(candidates)[2L]
+  } else {
+    stop("parameter '", parameter, "' appears nowhere in the equation: ",
+         "it is neither a fitted coefficient (",
+         paste(names(pieces$coefs), collapse = ", "),
+         ") nor a variable (",
+         paste(pieces$symbols, collapse = ", "),
+         "). Sweeping it would return n_param identical copies of the ",
+         "same fixed points", call. = FALSE)
+  }
+
+  # Names the equation never consults are diagnosed once, here, instead of
+  # once per parameter value inside the loop.
+  unused <- setdiff(names(exogenous_values), pieces$symbols)
+  if (length(unused)) {
+    warning("'exogenous_values' declares ",
+            paste0("'", unused, "'", collapse = ", "),
+            ", which the equation never consults: dropped", call. = FALSE)
+    exogenous_values <- exogenous_values[setdiff(names(exogenous_values),
+                                                 unused)]
+  }
+
   param_vals <- seq(param_range[1], param_range[2], length.out = n_param)
-  
-  all_fps <- list()
-  
+
+  all_fps <- vector("list", length(param_vals))
+  status <- data.frame(
+    parameter_value = param_vals,
+    n_fixed_points = NA_integer_,
+    status = NA_character_,
+    message = NA_character_
+  )
+
   for (i in seq_along(param_vals)) {
-    # Set parameter value
-    exog <- exogenous_values
-    exog[[parameter]] <- param_vals[i]
-    
     fps <- tryCatch({
-      analyze_fixed_points(equation, variable, range = z_range,
-                           exogenous_values = exog)
-    }, error = function(e) {
-      data.frame(fixed_point = numeric(0), stability = character(0), eigenvalue = numeric(0))
-    })
-    
-    if (nrow(fps) > 0) {
-      fps$parameter_value <- param_vals[i]
-      fps$parameter_name <- parameter
-      all_fps[[i]] <- fps
+      if (mode == "coefficient") {
+        suppressMessages(analyze_fixed_points(
+          equation, variable, range = z_range,
+          exogenous_values = exogenous_values,
+          coefficient_values = stats::setNames(list(param_vals[i]),
+                                               parameter)
+        ))
+      } else {
+        exog <- exogenous_values
+        exog[[parameter]] <- param_vals[i]
+        suppressMessages(analyze_fixed_points(
+          equation, variable, range = z_range,
+          exogenous_values = exog
+        ))
+      }
+    }, error = function(e) e)
+
+    if (inherits(fps, "error")) {
+      # A failure is recorded as a failure: it must never be mistaken for
+      # a parameter value that simply has no fixed points.
+      status$status[i] <- "error"
+      status$message[i] <- conditionMessage(fps)
+    } else {
+      status$n_fixed_points[i] <- nrow(fps)
+      status$status[i] <- if (nrow(fps) > 0) "ok" else "no_fixed_points"
+      if (nrow(fps) > 0) {
+        fps$parameter_value <- param_vals[i]
+        fps$parameter_name <- parameter
+        all_fps[[i]] <- fps
+      }
     }
   }
-  
+
   bifurc_data <- do.call(rbind, all_fps)
-  
+  if (is.null(bifurc_data)) {
+    bifurc_data <- data.frame(
+      fixed_point = numeric(0), stability = character(0),
+      eigenvalue = numeric(0), parameter_value = numeric(0),
+      parameter_name = character(0)
+    )
+  }
+
   result <- list(
     data = bifurc_data,
+    status = status,
+    mode = mode,
     parameter = parameter,
     variable = variable,
-    param_range = param_range
+    param_range = param_range,
+    exogenous_values = exogenous_values
   )
-  
+
   class(result) <- "bifurcation_analysis"
   return(result)
+}
+
+#' Print a Bifurcation Analysis
+#'
+#' @param x Object of class bifurcation_analysis.
+#' @param ... Additional arguments (ignored).
+#'
+#' @return \code{x}, invisibly.
+#' @export
+print.bifurcation_analysis <- function(x, ...) {
+  cat("Bifurcation analysis: fixed points of '", x$variable,
+      "' as '", x$parameter, "' varies (as a ",
+      if (is.null(x$mode)) "parameter" else x$mode, ")\n", sep = "")
+  if (!is.null(x$status)) {
+    n_ok <- sum(x$status$status == "ok")
+    n_empty <- sum(x$status$status == "no_fixed_points")
+    n_err <- sum(x$status$status == "error")
+    cat(sprintf(
+      "  %d parameter values in [%g, %g]: %d with fixed points, %d without, %d failed\n",
+      nrow(x$status), x$param_range[1], x$param_range[2],
+      n_ok, n_empty, n_err))
+    if (n_err > 0) {
+      first_err <- which(x$status$status == "error")[1]
+      cat("  first failure, at ", x$parameter, " = ",
+          format(x$status$parameter_value[first_err]), ": ",
+          x$status$message[first_err], "\n", sep = "")
+    }
+  }
+  if (length(x$exogenous_values)) {
+    cat("  exogenous variables held fixed: ",
+        paste(names(x$exogenous_values),
+              vapply(x$exogenous_values, format, character(1)),
+              sep = " = ", collapse = ", "), "\n", sep = "")
+  }
+  if (!is.null(x$data) && nrow(x$data) > 0) {
+    cat("  fixed points found: ", nrow(x$data), " (",
+        paste(names(table(x$data$stability)),
+              table(x$data$stability),
+              sep = ": ", collapse = ", "), ")\n", sep = "")
+  }
+  invisible(x)
 }
 
 #' Plot Bifurcation Diagram

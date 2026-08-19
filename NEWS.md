@@ -1,3 +1,72 @@
+# EmpiricalDynamics 0.1.9
+
+## The lm path of `analyze_fixed_points()` ignored the fitted coefficients
+
+For an `lm` (or `glm`) equation, the function deparsed the bare right-hand
+side of the formula and injected the coefficients into the evaluation
+environment under their names. But `lm` coefficient names are *term labels*
+-- `I(Z)`, `I(Z^2)`, `(Intercept)` -- which are not symbols of the deparsed
+text, so the bindings were never consulted and the bare terms were evaluated
+with their coefficients effectively set to 1. Fitted to `dZ = 2*Z - Z^2`,
+with coefficients recovered exactly as `2` and `-1`, it returned the fixed
+points of `Z + Z^2` -- without a word. Written without `I()` the failure
+changed shape instead of going away: a coefficient named `Z` collided with
+the search variable itself. The example on the function's own manual page
+took this path.
+
+`lm` and `glm` equations are now evaluated through their own `predict()`
+machinery (on the response scale for `glm`), so the coefficients enter
+exactly as fitted -- `I()` terms, factors and link functions included, and
+no name collision is possible. The `nls` and `symbolic_equation` paths,
+whose coefficient names are genuine symbols of their expressions, were
+correct and are unchanged.
+
+## A name that binds nothing is now reported instead of ignored
+
+Every name the equation consults must now be accounted for -- the search
+variable, a fitted coefficient, or a declared exogenous value. Previously,
+each of the following was silent: an unnamed `exogenous_values` entry (bound
+nothing -- `for (nm in names(x))` over a `NULL` runs zero times); declaring
+the search variable (overwritten at every grid point); declaring a name the
+equation never uses (no effect); declaring a name that collides with a
+fitted coefficient (silently *overwrote the fit*); and a free symbol with no
+declared value (evaluation failed point by point into `NA`s, or worse,
+picked up whatever the name meant in the enclosing environment). The first
+two and the last two are errors now; the never-consulted name is a warning.
+A new `coefficient_values` argument takes the deliberate case the collision
+error forbids: overriding a fitted coefficient by name, validated against
+the coefficients that exist.
+
+## A root the grid landed on exactly was reported twice
+
+Fixed points were detected as `diff(sign(f)) != 0` over the grid. A grid
+point falling exactly on a root has sign `0`, which that test counts as two
+changes -- one into the zero and one out of it -- so `uniroot()` refined the
+same root from both adjacent brackets and the point appeared twice in the
+output. An exact zero is now taken as a root in its own right, a crossing
+requires a strict sign flip, and two detections closer than half a grid step
+-- the instrument's own resolution -- are merged.
+
+## `analyze_bifurcations()` swept parameters that were not there
+
+The parameter was injected as a binding under its name and handed down as an
+exogenous value; if that name appeared nowhere in the equation, the binding
+was never consulted and the sweep returned `n_param` identical copies of the
+same fixed points, each labelled with the absent parameter's name. The
+parameter is now validated before the sweep: a fitted coefficient is varied
+as a coefficient (which also makes coefficients of `lm` equations, like
+`I(Z)`, valid bifurcation parameters -- previously impossible), a variable
+of the equation is varied as an exogenous value, anything else is an error,
+as is `parameter == variable`.
+
+Two more silences in the same loop: a parameter value whose analysis found
+no fixed points was dropped from the output entirely, so the requested grid
+could not be reconstructed from the result; and any error was caught and
+converted into the same empty frame, so a failure was indistinguishable from
+an absence. The returned object now carries `$status`, one row per requested
+parameter value -- `ok`, `no_fixed_points`, or `error` with the error's
+message -- plus `$mode`, and a `print()` method states the accounting.
+
 # EmpiricalDynamics 0.1.8
 
 ## The iterative GLS loop could not converge, and did not say so

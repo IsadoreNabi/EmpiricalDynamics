@@ -9,11 +9,13 @@ analyze_fixed_points(
   variable,
   range = c(-10, 10),
   n_grid = 100,
-  exogenous_values = list()
+  exogenous_values = list(),
+  coefficient_values = list()
 )
 }
 \arguments{
-\item{equation}{Fitted equation object.}
+\item{equation}{Fitted equation object (\code{symbolic_equation},
+\code{nls}, \code{lm} or \code{glm}).}
 
 \item{variable}{Name of the main variable.}
 
@@ -22,22 +24,40 @@ analyze_fixed_points(
 \item{n_grid}{Number of grid points for initial search.}
 
 \item{exogenous_values}{Named list of fixed values for exogenous variables.}
+
+\item{coefficient_values}{Named list of deliberate overrides for fitted
+coefficients; every name must match a fitted coefficient.}
 }
 \value{
-Data frame of fixed points with stability classification.
+Data frame of fixed points with stability classification. The
+values any exogenous variables were held at travel with the result as
+its \code{"exogenous_values"} attribute, because a fixed point found
+under fixed exogenous values is conditional on that fixing.
 }
 \description{
 Finds and characterizes fixed points of the discovered equation.
 }
-\examples{
-\donttest{
-# Toy example: dZ = 2*Z - Z^2 (Logistic growth)
-data <- data.frame(Z = seq(0.1, 3, length.out=50))
-data$dZ <- 2*data$Z - data$Z^2
-model <- stats::lm(dZ ~ I(Z) + I(Z^2) + 0, data = data)
+\details{
+For \code{lm} and \code{glm} equations the right-hand side is evaluated
+through the model's own \code{predict()} machinery (on the response scale
+for \code{glm}), so the fitted coefficients enter exactly as fitted --
+\code{I()} terms, factors and link functions included. For
+\code{symbolic_equation} and \code{nls} equations the expression is
+evaluated with the fitted coefficients bound by name.
 
-# Analyze (note: linear models on dZ aren't direct ODEs, but this demonstrates structure)
-# For correct usage, 'equation' should be from fit_specified_equation
-fp <- analyze_fixed_points(model, variable = "Z", range = c(0, 3))
+Every name consulted by the equation must be accounted for: the search
+\code{variable}, a fitted coefficient, or a value declared in
+\code{exogenous_values}. A free symbol without a value, an unnamed
+declaration, a declaration that collides with the search variable or with
+a fitted coefficient -- each of these is reported instead of being
+silently ignored or silently overwriting the fit. To vary a fitted
+coefficient deliberately, use \code{coefficient_values}.
 }
+\examples{
+# dZ = 2*Z - Z^2: fixed points at 0 (unstable, f' = +2)
+#                            and at 2 (stable,   f' = -2)
+data <- data.frame(Z = seq(0.1, 3, length.out = 50))
+data$dZ <- 2 * data$Z - data$Z^2
+model <- stats::lm(dZ ~ I(Z) + I(Z^2) + 0, data = data)
+analyze_fixed_points(model, variable = "Z", range = c(-1, 3))
 }

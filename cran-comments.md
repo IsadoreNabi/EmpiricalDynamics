@@ -1,12 +1,37 @@
-## Submission of EmpiricalDynamics 0.1.8 (bug-fix release)
+## Submission of EmpiricalDynamics 0.1.9 (bug-fix release)
 
-This is a patch release. It repairs the iterative GLS estimator for stochastic
-differential equations, whose convergence test could never be satisfied and
-which returned its last iteration rather than its best; the observation weights
-that the Julia symbolic-search backends accepted and silently discarded; and two
-internal functions that were each defined twice in the package sources. No
-exported function was removed or renamed, no argument changed meaning, and the
-one new argument is additive with a default. Details in NEWS.md:
+This is a patch release. It repairs the qualitative-analysis pair
+`analyze_fixed_points()` / `analyze_bifurcations()`, whose `lm`/`glm` path
+evaluated the bare formula terms with the fitted coefficients effectively set
+to 1, and whose bifurcation sweep accepted a parameter absent from the
+equation and returned `n_param` identical copies labelled with its name; the
+iterative GLS estimator for stochastic differential equations, whose
+convergence test could never be satisfied and which returned its last
+iteration rather than its best; the observation weights that the Julia
+symbolic-search backends accepted and silently discarded; and two internal
+functions that were each defined twice in the package sources. No exported
+function was removed or renamed, no argument changed meaning, and the new
+arguments are additive with defaults. Details in NEWS.md:
+
+* `analyze_fixed_points()` on an `lm`/`glm` deparsed the formula's RHS and
+  injected the coefficients into the evaluation environment under their
+  names -- but `lm` coefficient names are term labels (`I(Z)`, `I(Z^2)`),
+  not symbols of that text, so the bindings were never consulted. Fitted to
+  `dZ = 2*Z - Z^2` with coefficients recovered exactly, it returned the
+  fixed points of `Z + Z^2`, silently; the example on its own manual page
+  took this path. These models are now evaluated through their own
+  `predict()` machinery, so coefficients enter exactly as fitted. Names that
+  bind nothing (unnamed entries, the search variable, collisions with fitted
+  coefficients, free symbols without values) are now errors or warnings
+  instead of silences, and a new additive `coefficient_values` argument
+  covers the deliberate coefficient-override case.
+
+* `analyze_bifurcations()` now validates that the swept parameter is a
+  fitted coefficient or a variable of the equation. Its result gains
+  `$status` (one row per requested parameter value: `ok`,
+  `no_fixed_points`, or `error` with the message), so the requested grid is
+  always reconstructible and a failure is never mistaken for an absence,
+  plus a `print()` method.
 
 * `estimate_sde_iterative()` measured convergence by comparing the named
   coefficients of successive drift equations. An equation produced by a symbolic
@@ -47,7 +72,12 @@ one new argument is additive with a default. Details in NEWS.md:
 
 ## R CMD check results
 
-0 errors | 0 warnings | 0 notes
+0 errors | 0 warnings | 1 note
 
-The package test suite (268 assertions) passes with no failures, warnings or
-skips, both standalone and under `R CMD check --as-cran --run-donttest`.
+The note is `checking examples ... NOTE: compute_derivative 5.1s elapsed`,
+marginally over the 5s threshold on the core-limited test machine (checks
+run confined to 2 physical cores). `compute_derivative()` is unchanged in
+this release; three repeated runs measured 5.1-5.2s.
+
+The package test suite (330 assertions) passes with no failures, warnings
+or skips, both standalone and under `R CMD check --as-cran --run-donttest`.

@@ -19,7 +19,9 @@ analyze_bifurcations(
 
 \item{variable}{Name of the main variable.}
 
-\item{parameter}{Name of the parameter to vary.}
+\item{parameter}{Name of the parameter to vary. Must be a fitted
+coefficient or a variable of the equation, and must differ from
+\code{variable}.}
 
 \item{param_range}{Range for parameter values.}
 
@@ -30,8 +32,34 @@ analyze_bifurcations(
 \item{exogenous_values}{Fixed values for other variables.}
 }
 \value{
-Object of class "bifurcation_analysis".
+Object of class "bifurcation_analysis". \code{$data} holds the
+fixed points found; \code{$status} holds one row per requested
+parameter value -- \code{"ok"}, \code{"no_fixed_points"} or
+\code{"error"} with the error's message -- so the requested grid can
+always be reconstructed and a failure is never mistaken for an
+absence; \code{$mode} records whether the parameter was varied as a
+\code{"coefficient"} or as an \code{"exogenous"} variable.
 }
 \description{
 Examines how fixed points change as a parameter varies.
+}
+\details{
+The parameter must actually appear in the equation, and is varied
+according to what it is: a fitted coefficient is overridden through
+\code{coefficient_values} of \code{\link{analyze_fixed_points}}, and a
+free variable of the expression is bound through
+\code{exogenous_values}. A name that is neither is an error -- sweeping
+it would evaluate the same equation \code{n_param} times and label the
+identical copies with the parameter's name.
+}
+\examples{
+# dZ = r*Z - Z^2: transcritical bifurcation at r = 0
+set.seed(1)
+data <- data.frame(Z = seq(-1, 3, length.out = 80))
+data$dZ <- 2 * data$Z - data$Z^2 + 0.01 * stats::rnorm(80)
+fit <- stats::nls(dZ ~ r * Z - Z^2, data = data, start = list(r = 1))
+bif <- analyze_bifurcations(fit, variable = "Z", parameter = "r",
+                            param_range = c(-1, 1), n_param = 11,
+                            z_range = c(-3, 3))
+print(bif)
 }
