@@ -1,3 +1,114 @@
+# EmpiricalDynamics 0.1.11
+
+## A bifurcation sweep over an `rstanarm` fit returned the same fixed point at every parameter value
+
+`analyze_bifurcations()` varies a fitted coefficient by handing
+`coefficient_values` to `analyze_fixed_points()`, which writes the value into
+`equation$coefficients` and then evaluates the object through its own
+`predict()`. Evaluating through `predict()` is what made the `lm` and `glm`
+paths correct in 0.1.9. But the *write* and the *evaluation* are two separate
+assumptions and only the second was ever checked. For an `lm` the coefficients
+are the model, so the write reaches `predict()`. For an `rstanarm` fit --
+class `stanreg, glm, lm`, so `inherits(equation, "lm")` is `TRUE` and the
+object was accepted -- `$coefficients` is a posterior median, a *summary* of
+the draws, and `predict()` reads the draws. The write was discarded in
+silence.
+
+The result was a correctly shaped table with the same fixed point repeated at
+every parameter value, and that value was not one of the true ones. Measured
+on a quadratic fit, sweeping `I(Z^2)` over six values: the `lm` gave four
+distinct fixed points agreeing with `polyroot()` to eight figures, the
+`stanreg` gave `6.794909` six times.
+
+Two things changed, and the first is owed whether or not the second is wanted.
+
+**The substitution is now verified instead of assumed.** Before a sweep runs,
+the requested override must actually move the object's predictions somewhere
+on the search grid: `predict()` is called twice unchanged (a prediction that
+is not reproducible cannot testify about anything) and once with the
+substitution in place. An object that discards the write is refused with an
+`"ed_substitution_ignored"` condition naming the cause, instead of being swept
+into a table of identical copies. A coefficient whose term is identically zero
+over the search range -- which no honest object can respond to either -- is
+refused separately as `"ed_substitution_inert"`. The check is on the object's
+*behaviour*, not on its class name, so it catches any future class with the
+same property without anyone having to add it to a list. `analyze_bifurcations()`
+raises these conditions immediately rather than recording `n_param` copies of
+them in `$status`, because they are properties of the object and not of the
+parameter value.
+
+**A fit that carries posterior draws is now served through them.** Objects are
+recognised by whether they can produce a draws matrix covering their own
+coefficients, never by name, and the route is certified against the object's
+own `predict()` before it is used: the design matrix is rebuilt by the model's
+own terms -- `predvars`, `xlevels`, `contrasts`, so `I()` terms, factors and
+data-dependent bases come out as fitted -- and the per-draw predictions must
+average back to exactly what `predict()` returns, or the sweep is refused. The
+repair of 0.1.9 is therefore not undone: `predict()` remains the referent, and
+now certifies the evaluation instead of performing it.
+
+### The output of a posterior sweep carries uncertainty, and its shape is different
+
+Moving a coefficient to `v` does not mean the same thing for a posterior as
+for a point estimate, and the reading chosen is stated here because callers
+downstream have to print it. The coordinate is **set to `v` in every draw**,
+with the rest of the uncertainty left exactly as estimated: the interventional
+reading, `do(beta = v)`. It is not the conditional reading -- keeping only the
+draws that happen to agree with `v` -- because a bifurcation parameter is
+imposed rather than observed, because conditioning would drag the other
+coefficients along their posterior correlation and confound the sweep with a
+reweighting, and because it would run out of draws at exactly the extreme
+parameter values a bifurcation diagram exists to visit. Nor is it a collapse
+to a point estimate, which would return the `lm` answer under a Bayesian
+label.
+
+So **the answer at each parameter value is a distribution of fixed points, not
+a number**:
+
+- `analyze_fixed_points()` gains an `n_draws` argument and, for such a fit,
+  returns one block of rows per draw with a `draw` column. Its `"posterior"`
+  attribute says which shape came back and `"n_draws"` how many draws were
+  swept. Draws are thinned at even spacing, so the selection is reproducible
+  without a seed; the default of 200 puts the Monte Carlo error of a posterior
+  median near 0.09 posterior standard deviations.
+- `analyze_bifurcations()` gains `n_draws` and `interval`, and its result
+  gains `$posterior`, `$n_draws`, `$interval` and `$summary`. `$summary` holds
+  one row per parameter value per branch, with `fixed_point` the posterior
+  median and `fixed_point_lower`/`fixed_point_upper` a 90% interval by
+  default. `$data` carries the raw per-draw rows. `$status` gains `n_draws`
+  and `prob_n_fixed_points`, and its `n_fixed_points` is then the count most
+  draws agreed on rather than the number of rows.
+- `ed_consensus_fixed_points()` is exported to perform that reduction. It is
+  explicitly conditional: the modal count of fixed points is taken, ties
+  broken toward the smaller count, the draws attaining it are kept, their
+  roots ordered along the line, and `prob_n_fixed_points` reports what
+  fraction of the posterior the interval was computed from. Near a saddle-node
+  the draws disagree about *how many* fixed points there are, and that is a
+  finding rather than a nuisance.
+- `check_qualitative_behavior()` compares an expected number of fixed points
+  against that modal count, not against the number of rows, which for a
+  posterior fit would have been the number of fixed points times the number of
+  draws.
+- `print.bifurcation_analysis()` says how many draws were swept and that each
+  fixed point is an interval, and does not report the row count as a count of
+  fixed points.
+
+For a point estimate nothing about the returned shape changes.
+
+### Also
+
+The `"exogenous_values"` and `"coefficient_values"` attributes now travel with
+an empty result too. They were attached only when a fixed point was found, so
+"no fixed point under `W = 2`" came back without the record of what `W` was
+held at -- and that statement is as conditional as any other.
+
+The gate that existed could not have caught any of this. It checked the shape
+and the types of the returned table, and the returned table was correctly
+shaped. The tests now assert that the fixed points **vary** along the sweep,
+which is the whole content of the word "bifurcation"; both symptoms of the
+defect -- the flat table and the empty one -- fail that assertion against
+0.1.10.
+
 # EmpiricalDynamics 0.1.10
 
 ## `explore_dynamics()` fitted three forms and published only the winner's name

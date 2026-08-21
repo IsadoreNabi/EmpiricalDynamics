@@ -10,12 +10,15 @@ analyze_fixed_points(
   range = c(-10, 10),
   n_grid = 100,
   exogenous_values = list(),
-  coefficient_values = list()
+  coefficient_values = list(),
+  n_draws = 200L
 )
 }
 \arguments{
 \item{equation}{Fitted equation object (\code{symbolic_equation},
-\code{nls}, \code{lm} or \code{glm}).}
+\code{nls}, \code{lm} or \code{glm}), or any object inheriting from
+\code{lm} that either honours a coefficient substitution or exposes
+posterior draws covering its own coefficients.}
 
 \item{variable}{Name of the main variable.}
 
@@ -27,12 +30,25 @@ analyze_fixed_points(
 
 \item{coefficient_values}{Named list of deliberate overrides for fitted
 coefficients; every name must match a fitted coefficient.}
+
+\item{n_draws}{Number of posterior draws to sweep when \code{equation}
+carries a posterior; ignored otherwise. Draws are thinned at even
+spacing, so the selection is reproducible without a seed. The default of
+200 places the Monte Carlo error of a posterior median near 0.09
+posterior standard deviations and of a 5\% or 95\% quantile near 0.15.}
 }
 \value{
 Data frame of fixed points with stability classification. The
 values any exogenous variables were held at travel with the result as
 its \code{"exogenous_values"} attribute, because a fixed point found
-under fixed exogenous values is conditional on that fixing.
+under fixed exogenous values is conditional on that fixing; the
+deliberate coefficient overrides travel as \code{"coefficient_values"}.
+Both attributes are attached whether or not any fixed point was found.
+The \code{"posterior"} attribute says whether the sweep was run over
+posterior draws; when it is \code{TRUE} the frame has a \code{draw}
+column, holds one block of rows per draw, and \code{"n_draws"} gives how
+many draws were swept. \code{ed_consensus_fixed_points()} reduces such a
+frame to one row per branch.
 }
 \description{
 Finds and characterizes fixed points of the discovered equation.
@@ -44,6 +60,23 @@ for \code{glm}), so the fitted coefficients enter exactly as fitted --
 \code{I()} terms, factors and link functions included. For
 \code{symbolic_equation} and \code{nls} equations the expression is
 evaluated with the fitted coefficients bound by name.
+
+A fitted object that carries posterior draws -- an \code{rstanarm} fit, for
+instance, whose class is \code{stanreg, glm, lm} -- is swept through its
+draws instead of through its point estimate, and the result then carries
+one block of rows per draw with a \code{draw} column identifying them; see
+the \code{n_draws} argument and the \code{"posterior"} attribute of the
+return value. Objects are recognised by whether they can produce a draws
+matrix covering their own coefficients, not by class name.
+
+When \code{coefficient_values} is used, the substitution is verified rather
+than assumed: the requested override must actually move the predictions
+somewhere on the search grid. An object whose \code{predict()} does not read
+\code{$coefficients} -- which is true of every fit that stores its estimate
+elsewhere and merely summarises it into \code{$coefficients} -- is refused
+with an \code{"ed_substitution_ignored"} condition instead of being swept
+into a table of identical copies. A coefficient whose term is identically
+zero over the search range is refused as \code{"ed_substitution_inert"}.
 
 Every name consulted by the equation must be accounted for: the search
 \code{variable}, a fitted coefficient, or a value declared in

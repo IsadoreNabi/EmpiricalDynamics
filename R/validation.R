@@ -930,6 +930,23 @@ ed_check_named_list <- function(x, what) {
 #' \code{symbolic_equation} and \code{nls} equations the expression is
 #' evaluated with the fitted coefficients bound by name.
 #'
+#' A fitted object that carries posterior draws -- an \code{rstanarm} fit, for
+#' instance, whose class is \code{stanreg, glm, lm} -- is swept through its
+#' draws instead of through its point estimate, and the result then carries
+#' one block of rows per draw with a \code{draw} column identifying them; see
+#' the \code{n_draws} argument and the \code{"posterior"} attribute of the
+#' return value. Objects are recognised by whether they can produce a draws
+#' matrix covering their own coefficients, not by class name.
+#'
+#' When \code{coefficient_values} is used, the substitution is verified rather
+#' than assumed: the requested override must actually move the predictions
+#' somewhere on the search grid. An object whose \code{predict()} does not read
+#' \code{$coefficients} -- which is true of every fit that stores its estimate
+#' elsewhere and merely summarises it into \code{$coefficients} -- is refused
+#' with an \code{"ed_substitution_ignored"} condition instead of being swept
+#' into a table of identical copies. A coefficient whose term is identically
+#' zero over the search range is refused as \code{"ed_substitution_inert"}.
+#'
 #' Every name consulted by the equation must be accounted for: the search
 #' \code{variable}, a fitted coefficient, or a value declared in
 #' \code{exogenous_values}. A free symbol without a value, an unnamed
@@ -939,18 +956,32 @@ ed_check_named_list <- function(x, what) {
 #' coefficient deliberately, use \code{coefficient_values}.
 #'
 #' @param equation Fitted equation object (\code{symbolic_equation},
-#'   \code{nls}, \code{lm} or \code{glm}).
+#'   \code{nls}, \code{lm} or \code{glm}), or any object inheriting from
+#'   \code{lm} that either honours a coefficient substitution or exposes
+#'   posterior draws covering its own coefficients.
 #' @param variable Name of the main variable.
 #' @param range Numeric vector of length 2 specifying search range.
 #' @param n_grid Number of grid points for initial search.
 #' @param exogenous_values Named list of fixed values for exogenous variables.
 #' @param coefficient_values Named list of deliberate overrides for fitted
 #'   coefficients; every name must match a fitted coefficient.
+#' @param n_draws Number of posterior draws to sweep when \code{equation}
+#'   carries a posterior; ignored otherwise. Draws are thinned at even
+#'   spacing, so the selection is reproducible without a seed. The default of
+#'   200 places the Monte Carlo error of a posterior median near 0.09
+#'   posterior standard deviations and of a 5% or 95% quantile near 0.15.
 #'
 #' @return Data frame of fixed points with stability classification. The
 #'   values any exogenous variables were held at travel with the result as
 #'   its \code{"exogenous_values"} attribute, because a fixed point found
-#'   under fixed exogenous values is conditional on that fixing.
+#'   under fixed exogenous values is conditional on that fixing; the
+#'   deliberate coefficient overrides travel as \code{"coefficient_values"}.
+#'   Both attributes are attached whether or not any fixed point was found.
+#'   The \code{"posterior"} attribute says whether the sweep was run over
+#'   posterior draws; when it is \code{TRUE} the frame has a \code{draw}
+#'   column, holds one block of rows per draw, and \code{"n_draws"} gives how
+#'   many draws were swept. \code{ed_consensus_fixed_points()} reduces such a
+#'   frame to one row per branch.
 #' @examples
 #' # dZ = 2*Z - Z^2: fixed points at 0 (unstable, f' = +2)
 #' #                            and at 2 (stable,   f' = -2)
@@ -963,7 +994,8 @@ analyze_fixed_points <- function(equation, variable,
                                  range = c(-10, 10),
                                  n_grid = 100,
                                  exogenous_values = list(),
-                                 coefficient_values = list()) {
+                                 coefficient_values = list(),
+                                 n_draws = 200L) {
 
   if (!is.character(variable) || length(variable) != 1L || !nzchar(variable)) {
     stop("'variable' must be a single variable name", call. = FALSE)
@@ -971,6 +1003,11 @@ analyze_fixed_points <- function(equation, variable,
   if (!is.numeric(range) || length(range) != 2L || !all(is.finite(range)) ||
       range[1] >= range[2]) {
     stop("'range' must be two finite numbers in increasing order",
+         call. = FALSE)
+  }
+  if (!is.numeric(n_draws) || length(n_draws) != 1L || is.na(n_draws) ||
+      n_draws < 1) {
+    stop("'n_draws' must be a single number of posterior draws, at least 1",
          call. = FALSE)
   }
   ed_check_named_list(exogenous_values, "exogenous_values")
@@ -1007,6 +1044,11 @@ analyze_fixed_points <- function(equation, variable,
             "no effect", call. = FALSE)
   }
 
+  grid <- seq(range[1], range[2], length.out = n_grid)
+  draw_f <- NULL
+  vals_grid <- NULL
+  b_draws <- NULL
+
   if (pieces$kind == "model") {
     # lm / glm: evaluate through the model's own prediction machinery.
     needed <- setdiff(pieces$symbols, c(variable, names(exogenous_values)))
@@ -1017,27 +1059,74 @@ analyze_fixed_points <- function(equation, variable,
            if (length(needed) == 1L) "it" else "them",
            ": pass fixed values through 'exogenous_values'", call. = FALSE)
     }
-    if (length(coefficient_values)) {
-      for (nm in names(coefficient_values)) {
-        equation$coefficients[nm] <- as.numeric(coefficient_values[[nm]])
-      }
-    }
     is_glm <- inherits(equation, "glm")
-    f_vec <- function(z) {
-      nd <- stats::setNames(data.frame(z = z), variable)
-      for (nm in names(exogenous_values)) {
-        nd[[nm]] <- exogenous_values[[nm]]
-      }
-      tryCatch({
-        if (is_glm) {
-          as.numeric(stats::predict(equation, newdata = nd,
-                                    type = "response"))
-        } else {
-          as.numeric(stats::predict(equation, newdata = nd))
+    # One evaluator, built from whichever object it is handed: the fit as it
+    # came, or the fit with the deliberate overrides written into it. The
+    # verification below compares the two through this same route, so what it
+    # certifies is the route the sweep actually uses.
+    make_f <- function(m) {
+      function(z) {
+        nd <- stats::setNames(data.frame(z = z), variable)
+        for (nm in names(exogenous_values)) {
+          nd[[nm]] <- exogenous_values[[nm]]
         }
-      }, error = function(e) rep(NA_real_, length(z)))
+        tryCatch({
+          if (is_glm) {
+            as.numeric(stats::predict(m, newdata = nd, type = "response"))
+          } else {
+            as.numeric(stats::predict(m, newdata = nd))
+          }
+        }, error = function(e) rep(NA_real_, length(z)))
+      }
     }
-    f <- function(z) f_vec(z)
+    design <- ed_design_of(equation, variable, exogenous_values)
+    b_draws <- ed_draws_of(equation)
+    # An override that asks for the value already fitted moves nothing by
+    # arithmetic and must not be mistaken for an override that was ignored.
+    effective <- ed_effective_overrides(coefficient_values, coefs)
+
+    if (is.null(b_draws)) {
+      substituted <- equation
+      if (length(coefficient_values)) {
+        for (nm in names(coefficient_values)) {
+          substituted$coefficients[nm] <- as.numeric(coefficient_values[[nm]])
+        }
+      }
+      if (length(effective)) {
+        ed_verify_substitution(make_f, equation, substituted, effective,
+                               design, grid, equation)
+      }
+      f_vec <- make_f(substituted)
+      f <- function(z) f_vec(z)
+    } else {
+      linkinv <- ed_linkinv_of(equation, is_glm)
+      if (is.null(linkinv)) {
+        ed_stop("ed_uncertifiable_substitution", paste0(
+          "this ", paste(class(equation), collapse = "/"), " object carries ",
+          "posterior draws but exposes no family, so a per draw prediction ",
+          "cannot be put on the same scale as its own predict()"))
+      }
+      ed_certify_design(make_f(equation), design, b_draws, linkinv, grid,
+                        equation)
+      if (length(effective) &&
+          isTRUE(ed_column_is_inert(design, names(effective), grid))) {
+        ed_stop_inert(names(effective))
+      }
+      b_draws <- ed_thin_draws(b_draws, n_draws)
+      for (nm in names(coefficient_values)) {
+        b_draws[, nm] <- as.numeric(coefficient_values[[nm]])
+      }
+      cn <- colnames(b_draws)
+      vals_grid <- linkinv(design(grid)[, cn, drop = FALSE] %*% t(b_draws))
+      draw_f <- function(s) {
+        b <- b_draws[s, ]
+        function(z) {
+          x <- tryCatch(design(z), error = function(e) NULL)
+          if (is.null(x)) return(rep(NA_real_, length(z)))
+          as.numeric(linkinv(x[, cn, drop = FALSE] %*% b))
+        }
+      }
+    }
   } else {
     expr_str <- pieces$expr_str
     clash <- intersect(names(exogenous_values), names(coefs))
@@ -1086,98 +1175,58 @@ analyze_fixed_points <- function(equation, variable,
     f_vec <- function(z) sapply(z, f)
   }
 
-  # Grid search for sign changes
-  grid <- seq(range[1], range[2], length.out = n_grid)
-  f_vals <- f_vec(grid)
-  
-  # Find sign changes
-  valid_idx <- which(!is.na(f_vals))
-  if (length(valid_idx) < 2) {
-    message("Could not evaluate function on grid")
-    return(data.frame(
-      fixed_point = numeric(0),
-      stability = character(0),
-      eigenvalue = numeric(0)
-    ))
-  }
-  
-  # A grid point that lands exactly on a root has sign 0. Counting it
-  # through diff(sign(...)) != 0 counted the same crossing twice -- once
-  # into the zero and once out of it -- and uniroot then refined the same
-  # root from both adjacent brackets, so it appeared twice in the output.
-  # An exact zero is a root in its own right; a crossing is a strict sign
-  # flip between consecutive evaluable grid points.
-  s <- sign(f_vals[valid_idx])
-  fixed_points <- grid[valid_idx][s == 0]
-
-  strict_flips <- which(s[-length(s)] * s[-1] < 0)
-  for (i in strict_flips) {
-    idx1 <- valid_idx[i]
-    idx2 <- valid_idx[i + 1]
-    # Refine with uniroot
-    fp <- tryCatch({
-      stats::uniroot(f, c(grid[idx1], grid[idx2]))$root
-    }, error = function(e) NA)
-
-    if (!is.na(fp)) {
-      fixed_points <- c(fixed_points, fp)
-    }
-  }
-
-  # Two detections closer than half a grid step are the same root seen
-  # twice: the grid cannot resolve distinct roots below its own spacing.
-  if (length(fixed_points) > 1) {
-    fixed_points <- sort(fixed_points)
-    step <- (range[2] - range[1]) / (n_grid - 1)
-    fixed_points <- fixed_points[c(TRUE, diff(fixed_points) > step / 2)]
-  }
-  
-  if (length(fixed_points) == 0) {
-    message("No fixed points found in specified range")
-    return(data.frame(
-      fixed_point = numeric(0),
-      stability = character(0),
-      eigenvalue = numeric(0)
-    ))
-  }
-  
-  # Classify stability (compute derivative at fixed point)
-  eps <- 1e-6
-  stability <- character(length(fixed_points))
-  eigenvalues <- numeric(length(fixed_points))
-  
-  for (i in seq_along(fixed_points)) {
-    fp <- fixed_points[i]
-    f_plus <- f(fp + eps)
-    f_minus <- f(fp - eps)
-    if (is.na(f_plus) || is.na(f_minus)) {
-      eigenvalues[i] <- NA
-      stability[i] <- "unknown"
-    } else {
-      df_dz <- (f_plus - f_minus) / (2 * eps)
-      eigenvalues[i] <- df_dz
-      
-      if (df_dz < -eps) {
-        stability[i] <- "stable"
-      } else if (df_dz > eps) {
-        stability[i] <- "unstable"
-      } else {
-        stability[i] <- "marginal"
+  if (is.null(draw_f)) {
+    found <- ed_fixed_points_from(f, f_vec(grid), grid, range, n_grid)
+    reason <- attr(found, "ed_reason")
+    result <- data.frame(fixed_point = found$fixed_point,
+                         stability = found$stability,
+                         eigenvalue = found$eigenvalue)
+    n_used <- NA_integer_
+  } else {
+    # One sweep per posterior draw, each found by the same core the point
+    # estimate goes through. The reasons are collected and reported once:
+    # a caller sweeping hundreds of draws must not be told hundreds of times.
+    n_used <- nrow(b_draws)
+    per <- vector("list", n_used)
+    reasons <- character(n_used)
+    for (s in seq_len(n_used)) {
+      one <- ed_fixed_points_from(draw_f(s), vals_grid[, s], grid, range,
+                                  n_grid)
+      reasons[s] <- attr(one, "ed_reason")
+      if (nrow(one)) {
+        one$draw <- s
+        per[[s]] <- one
       }
     }
+    result <- do.call(rbind, per)
+    if (is.null(result)) {
+      result <- data.frame(fixed_point = numeric(0), stability = character(0),
+                           eigenvalue = numeric(0), draw = integer(0))
+    }
+    reason <- if (all(reasons == "unevaluable")) {
+      "unevaluable"
+    } else if (!any(reasons == "ok")) {
+      "none"
+    } else {
+      "ok"
+    }
   }
-  
-  result <- data.frame(
-    fixed_point = fixed_points,
-    stability = stability,
-    eigenvalue = eigenvalues
-  )
+  if (identical(reason, "unevaluable")) {
+    message("Could not evaluate function on grid")
+  } else if (identical(reason, "none")) {
+    message("No fixed points found in specified range")
+  }
 
   # A fixed point found with exogenous variables held fixed is conditional
-  # on that fixing: the declaration travels with the result.
+  # on that fixing: the declaration travels with the result -- and it travels
+  # with an empty result too, because "no fixed point under W = 2" is as
+  # conditional a statement as any other.
+  rownames(result) <- NULL
   attr(result, "variable") <- variable
   attr(result, "exogenous_values") <- exogenous_values
   attr(result, "coefficient_values") <- coefficient_values
+  attr(result, "posterior") <- !is.null(draw_f)
+  attr(result, "n_draws") <- n_used
   return(result)
 }
 
@@ -1200,7 +1249,23 @@ analyze_fixed_points <- function(equation, variable,
 #' \code{symbolic_equation} equations a coefficient name is a symbol of the
 #' formula itself and is taken as the coefficient.
 #'
-#' @param equation Fitted equation object.
+#' When \code{equation} carries posterior draws, the sweep is run once per
+#' draw and the answer is a distribution of fixed points at every parameter
+#' value rather than a point. This is the interventional reading of the
+#' sweep -- the coordinate is SET to each value in every draw, the remaining
+#' uncertainty left as estimated -- and not the conditional one, which would
+#' keep only the draws that happen to agree with the value and would empty out
+#' at exactly the extreme parameter values a bifurcation diagram exists to
+#' visit. \code{$data} then carries a \code{draw} column and \code{$summary}
+#' holds the branch-by-branch reduction.
+#'
+#' @param equation Fitted equation object: a \code{symbolic_equation}, an
+#'   \code{nls}, an \code{lm} or a \code{glm}. An object inheriting from
+#'   \code{lm} is accepted when it either honours a coefficient substitution
+#'   or exposes posterior draws covering its own coefficients -- an
+#'   \code{rstanarm} fit does the latter. One that does neither is refused
+#'   rather than swept into identical copies; see
+#'   \code{\link{analyze_fixed_points}}.
 #' @param variable Name of the main variable.
 #' @param parameter Name of the parameter to vary. Must be a fitted
 #'   coefficient or a variable of the equation, and must differ from
@@ -1209,6 +1274,14 @@ analyze_fixed_points <- function(equation, variable,
 #' @param n_param Number of parameter values to test.
 #' @param z_range Range for searching fixed points.
 #' @param exogenous_values Fixed values for other variables.
+#' @param n_draws Number of posterior draws to sweep at each parameter value
+#'   when \code{equation} carries a posterior; ignored otherwise. See
+#'   \code{\link{analyze_fixed_points}}.
+#' @param interval Width of the posterior interval reported in
+#'   \code{$summary}; ignored when \code{equation} carries no posterior. The
+#'   default of 0.9 is the width \code{rstanarm} itself reports, chosen there
+#'   because the 2.5% and 97.5% quantiles need several times as many draws
+#'   for the same Monte Carlo error as the 5% and 95% ones.
 #'
 #' @return Object of class "bifurcation_analysis". \code{$data} holds the
 #'   fixed points found; \code{$status} holds one row per requested
@@ -1217,6 +1290,15 @@ analyze_fixed_points <- function(equation, variable,
 #'   always be reconstructed and a failure is never mistaken for an
 #'   absence; \code{$mode} records whether the parameter was varied as a
 #'   \code{"coefficient"} or as an \code{"exogenous"} variable.
+#'   \code{$posterior} says whether the sweep carries uncertainty. When it
+#'   does, \code{$data} gains a \code{draw} column and holds one block of rows
+#'   per draw per parameter value; \code{$status} gains \code{n_draws} and
+#'   \code{prob_n_fixed_points}, and its \code{n_fixed_points} is the count
+#'   most draws agreed on rather than the number of rows; and \code{$summary}
+#'   holds one row per parameter value per branch, with
+#'   \code{fixed_point_lower} and \code{fixed_point_upper} bounding a
+#'   \code{$interval} posterior interval. \code{$summary} is \code{NULL} for a
+#'   point estimate, where \code{$data} already is the answer.
 #' @examples
 #' # dZ = r*Z - Z^2: transcritical bifurcation at r = 0
 #' set.seed(1)
@@ -1232,8 +1314,15 @@ analyze_bifurcations <- function(equation, variable, parameter,
                                  param_range = c(-5, 5),
                                  n_param = 50,
                                  z_range = c(-10, 10),
-                                 exogenous_values = list()) {
+                                 exogenous_values = list(),
+                                 n_draws = 200L,
+                                 interval = 0.9) {
 
+  if (!is.numeric(interval) || length(interval) != 1L || is.na(interval) ||
+      interval <= 0 || interval >= 1) {
+    stop("'interval' must be a single number strictly between 0 and 1",
+         call. = FALSE)
+  }
   if (!is.character(parameter) || length(parameter) != 1L ||
       !nzchar(parameter)) {
     stop("'parameter' must be a single name", call. = FALSE)
@@ -1288,12 +1377,17 @@ analyze_bifurcations <- function(equation, variable, parameter,
   param_vals <- seq(param_range[1], param_range[2], length.out = n_param)
 
   all_fps <- vector("list", length(param_vals))
+  all_sum <- vector("list", length(param_vals))
   status <- data.frame(
     parameter_value = param_vals,
     n_fixed_points = NA_integer_,
     status = NA_character_,
-    message = NA_character_
+    message = NA_character_,
+    n_draws = NA_integer_,
+    prob_n_fixed_points = NA_real_
   )
+  posterior <- FALSE
+  n_used <- NA_integer_
 
   for (i in seq_along(param_vals)) {
     fps <- tryCatch({
@@ -1302,32 +1396,68 @@ analyze_bifurcations <- function(equation, variable, parameter,
           equation, variable, range = z_range,
           exogenous_values = exogenous_values,
           coefficient_values = stats::setNames(list(param_vals[i]),
-                                               parameter)
+                                               parameter),
+          n_draws = n_draws
         ))
       } else {
         exog <- exogenous_values
         exog[[parameter]] <- param_vals[i]
         suppressMessages(analyze_fixed_points(
           equation, variable, range = z_range,
-          exogenous_values = exog
+          exogenous_values = exog, n_draws = n_draws
         ))
       }
     }, error = function(e) e)
 
+    if (inherits(fps, "ed_error")) {
+      # Whether this object honours a coefficient substitution at all, and
+      # whether the swept term can move anything, are properties of the
+      # object and the range -- not of the parameter value. Recording them
+      # per value would bury the one fact that matters under n_param copies
+      # of it, and hand back an object whose $status is entirely failures.
+      stop(fps)
+    }
     if (inherits(fps, "error")) {
       # A failure is recorded as a failure: it must never be mistaken for
       # a parameter value that simply has no fixed points.
       status$status[i] <- "error"
       status$message[i] <- conditionMessage(fps)
+      next
+    }
+
+    if (isTRUE(attr(fps, "posterior"))) {
+      posterior <- TRUE
+      n_used <- attr(fps, "n_draws")
+      cons <- ed_consensus_fixed_points(fps, n_used, interval)
+      status$n_fixed_points[i] <- if (nrow(cons)) {
+        cons$n_fixed_points[1]
+      } else {
+        0L
+      }
+      status$n_draws[i] <- n_used
+      status$prob_n_fixed_points[i] <- attr(cons, "prob_n_fixed_points")
+      if (nrow(cons) > 0) {
+        cons$parameter_value <- param_vals[i]
+        cons$parameter_name <- parameter
+        all_sum[[i]] <- cons
+      }
     } else {
       status$n_fixed_points[i] <- nrow(fps)
-      status$status[i] <- if (nrow(fps) > 0) "ok" else "no_fixed_points"
-      if (nrow(fps) > 0) {
-        fps$parameter_value <- param_vals[i]
-        fps$parameter_name <- parameter
-        all_fps[[i]] <- fps
-      }
     }
+    status$status[i] <- if (nrow(fps) > 0) "ok" else "no_fixed_points"
+    if (nrow(fps) > 0) {
+      fps$parameter_value <- param_vals[i]
+      fps$parameter_name <- parameter
+      all_fps[[i]] <- fps
+    }
+  }
+
+  # The two posterior columns are carried through the loop so that a value
+  # can be written at any index, and dropped again when no draw was ever
+  # swept: a point estimate's $status must keep the shape it always had.
+  if (!posterior) {
+    status$n_draws <- NULL
+    status$prob_n_fixed_points <- NULL
   }
 
   bifurc_data <- do.call(rbind, all_fps)
@@ -1337,16 +1467,34 @@ analyze_bifurcations <- function(equation, variable, parameter,
       eigenvalue = numeric(0), parameter_value = numeric(0),
       parameter_name = character(0)
     )
+    if (posterior) bifurc_data$draw <- integer(0)
+  }
+  rownames(bifurc_data) <- NULL
+
+  bifurc_summary <- NULL
+  if (posterior) {
+    bifurc_summary <- do.call(rbind, all_sum)
+    if (is.null(bifurc_summary)) {
+      bifurc_summary <- ed_consensus_fixed_points(
+        bifurc_data[0, , drop = FALSE], 1L, interval)[0, , drop = FALSE]
+      bifurc_summary$parameter_value <- numeric(0)
+      bifurc_summary$parameter_name <- character(0)
+    }
+    rownames(bifurc_summary) <- NULL
   }
 
   result <- list(
     data = bifurc_data,
+    summary = bifurc_summary,
     status = status,
     mode = mode,
     parameter = parameter,
     variable = variable,
     param_range = param_range,
-    exogenous_values = exogenous_values
+    exogenous_values = exogenous_values,
+    posterior = posterior,
+    n_draws = n_used,
+    interval = if (posterior) interval else NA_real_
   )
 
   class(result) <- "bifurcation_analysis"
@@ -1385,7 +1533,23 @@ print.bifurcation_analysis <- function(x, ...) {
               vapply(x$exogenous_values, format, character(1)),
               sep = " = ", collapse = ", "), "\n", sep = "")
   }
-  if (!is.null(x$data) && nrow(x$data) > 0) {
+  if (isTRUE(x$posterior)) {
+    # The count of rows is not the count of fixed points here: it is the
+    # count of fixed points times the count of draws. Saying "fixed points
+    # found: 8400" would be arithmetically true and read as a finding.
+    cat("  swept over ", x$n_draws,
+        " posterior draws per parameter value: each fixed point is a ",
+        format(100 * x$interval), "% interval, not a number\n", sep = "")
+    if (!is.null(x$summary) && nrow(x$summary) > 0) {
+      cat("  branches summarised: ", nrow(x$summary), " (",
+          paste(names(table(x$summary$stability)),
+                table(x$summary$stability),
+                sep = ": ", collapse = ", "), ")\n", sep = "")
+      worst <- min(x$summary$prob_n_fixed_points)
+      cat("  draws agreeing on the number of fixed points: ",
+          format(100 * min(1, worst), digits = 3), "% at worst\n", sep = "")
+    }
+  } else if (!is.null(x$data) && nrow(x$data) > 0) {
     cat("  fixed points found: ", nrow(x$data), " (",
         paste(names(table(x$data$stability)),
               table(x$data$stability),
@@ -1467,8 +1631,21 @@ check_qualitative_behavior <- function(equation, data, variable,
   
   # Check 1: Number of fixed points
   fps <- analyze_fixed_points(equation, variable, range = var_range)
+  # A posterior sweep returns one block of rows per draw. Counting those rows
+  # would report the number of draws times the number of fixed points and
+  # compare it to an expectation about fixed points. The posterior is reduced
+  # to the count most draws agreed on, and how much of the posterior that was
+  # is reported rather than assumed away.
+  results$posterior <- isTRUE(attr(fps, "posterior"))
+  if (results$posterior) {
+    fps <- ed_consensus_fixed_points(fps, attr(fps, "n_draws"))
+    results$messages <- c(results$messages, sprintf(
+      "Posterior fit: checks are against the modal count over %d draws, held by %s of them",
+      attr(fps, "n_draws"),
+      paste0(format(100 * attr(fps, "prob_n_fixed_points"), digits = 3), "%")))
+  }
   results$checks$fixed_points <- fps
-  
+
   if (!is.null(expected_features$n_fixed_points)) {
     passed <- nrow(fps) == expected_features$n_fixed_points
     results$passed <- c(results$passed, fp_count = passed)

@@ -11,11 +11,19 @@ analyze_bifurcations(
   param_range = c(-5, 5),
   n_param = 50,
   z_range = c(-10, 10),
-  exogenous_values = list()
+  exogenous_values = list(),
+  n_draws = 200L,
+  interval = 0.9
 )
 }
 \arguments{
-\item{equation}{Fitted equation object.}
+\item{equation}{Fitted equation object: a \code{symbolic_equation}, an
+\code{nls}, an \code{lm} or a \code{glm}. An object inheriting from
+\code{lm} is accepted when it either honours a coefficient substitution
+or exposes posterior draws covering its own coefficients -- an
+\code{rstanarm} fit does the latter. One that does neither is refused
+rather than swept into identical copies; see
+\code{\link{analyze_fixed_points}}.}
 
 \item{variable}{Name of the main variable.}
 
@@ -30,6 +38,16 @@ coefficient or a variable of the equation, and must differ from
 \item{z_range}{Range for searching fixed points.}
 
 \item{exogenous_values}{Fixed values for other variables.}
+
+\item{n_draws}{Number of posterior draws to sweep at each parameter value
+when \code{equation} carries a posterior; ignored otherwise. See
+\code{\link{analyze_fixed_points}}.}
+
+\item{interval}{Width of the posterior interval reported in
+\code{$summary}; ignored when \code{equation} carries no posterior. The
+default of 0.9 is the width \code{rstanarm} itself reports, chosen there
+because the 2.5\% and 97.5\% quantiles need several times as many draws
+for the same Monte Carlo error as the 5\% and 95\% ones.}
 }
 \value{
 Object of class "bifurcation_analysis". \code{$data} holds the
@@ -39,6 +57,15 @@ parameter value -- \code{"ok"}, \code{"no_fixed_points"} or
 always be reconstructed and a failure is never mistaken for an
 absence; \code{$mode} records whether the parameter was varied as a
 \code{"coefficient"} or as an \code{"exogenous"} variable.
+\code{$posterior} says whether the sweep carries uncertainty. When it
+does, \code{$data} gains a \code{draw} column and holds one block of rows
+per draw per parameter value; \code{$status} gains \code{n_draws} and
+\code{prob_n_fixed_points}, and its \code{n_fixed_points} is the count
+most draws agreed on rather than the number of rows; and \code{$summary}
+holds one row per parameter value per branch, with
+\code{fixed_point_lower} and \code{fixed_point_upper} bounding a
+\code{$interval} posterior interval. \code{$summary} is \code{NULL} for a
+point estimate, where \code{$data} already is the answer.
 }
 \description{
 Examines how fixed points change as a parameter varies.
@@ -58,6 +85,16 @@ the name is taken as the variable (labels that are never variables, like
 \code{"I(Z)"}, denote their coefficient); for \code{nls} and
 \code{symbolic_equation} equations a coefficient name is a symbol of the
 formula itself and is taken as the coefficient.
+
+When \code{equation} carries posterior draws, the sweep is run once per
+draw and the answer is a distribution of fixed points at every parameter
+value rather than a point. This is the interventional reading of the
+sweep -- the coordinate is SET to each value in every draw, the remaining
+uncertainty left as estimated -- and not the conditional one, which would
+keep only the draws that happen to agree with the value and would empty out
+at exactly the extreme parameter values a bifurcation diagram exists to
+visit. \code{$data} then carries a \code{draw} column and \code{$summary}
+holds the branch-by-branch reduction.
 }
 \examples{
 # dZ = r*Z - Z^2: transcritical bifurcation at r = 0
