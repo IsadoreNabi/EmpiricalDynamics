@@ -51,6 +51,13 @@ free variable of the expression is bound through
 \code{exogenous_values}. A name that is neither is an error -- sweeping
 it would evaluate the same equation \code{n_param} times and label the
 identical copies with the parameter's name.
+
+When one name could denote both: for \code{lm}/\code{glm} equations a
+plain term's coefficient label coincides with the variable's name, and
+the name is taken as the variable (labels that are never variables, like
+\code{"I(Z)"}, denote their coefficient); for \code{nls} and
+\code{symbolic_equation} equations a coefficient name is a symbol of the
+formula itself and is taken as the coefficient.
 }
 \examples{
 # dZ = r*Z - Z^2: transcritical bifurcation at r = 0

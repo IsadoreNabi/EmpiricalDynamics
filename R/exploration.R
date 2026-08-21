@@ -22,9 +22,28 @@ NULL
 #' @return A list containing:
 #' \itemize{
 #'   \item suggestions: Character vector of suggested functional forms
-#'   \item statistics: Data frame of diagnostic statistics
+#'   \item statistics: A named \emph{list} of diagnostic statistics, not a data
+#'     frame. Its entries are \code{target_mean}, \code{target_sd},
+#'     \code{target_range}, \code{trend_correlation}, and then, for each
+#'     predictor, \code{cor_<pred>} with the correlation, \code{nonlin_<pred>}
+#'     with the name of the form the AIC preferred, \code{fit_<pred>} with that
+#'     form itself, and \code{interaction_<a>_<b>} with the p-value of a pair.
 #'   \item plots: List of ggplot objects (if available)
 #' }
+#'
+#' @section The published fit: \code{fit_<pred>} carries the fit that won the
+#'   AIC comparison, so that a caller can ask questions of the curve and not
+#'   only of its name. It is a list with \code{form} (the same word as
+#'   \code{nonlin_<pred>}), \code{degree} (1, 2 or 3), \code{coefficients},
+#'   \code{predictor_range} and \code{aic} (all three compared values).
+#'
+#'   \strong{The coefficients are in ascending powers of the predictor} and are
+#'   \code{degree + 1} long, so that the fitted value at \code{x} is
+#'   \code{sum(coefficients * x^(0:degree))}. An aliased term comes back as
+#'   \code{NA} in its own slot rather than shifting the powers. The range is the
+#'   observed range of the predictor, which is the interval over which anything
+#'   asked of the fitted curve is a statement about the data rather than an
+#'   extrapolation.
 #'
 #' @examples
 #' \donttest{
@@ -168,7 +187,25 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
       
       statistics[[paste0("cor_", pred)]] <- r
       statistics[[paste0("nonlin_", pred)]] <- form_names[best_form]
-      
+
+      # Publish the fit that won, and not only its name. The three models are
+      # already estimated above and were being discarded here; a caller that
+      # knows the shape but not the shape's coefficients cannot ask anything of
+      # the fitted curve -- whether it is monotone over the range observed, for
+      # one, which is a different question from whether it is curved. The
+      # coefficients are extracted by term name rather than by position so that
+      # an aliased term comes back as NA in its own slot instead of shifting
+      # every power by one.
+      best_model <- list(lm_lin, lm_quad, lm_cubic)[[best_form]]
+      terms_of_form <- c("(Intercept)", "x", "x2", "x3")[seq_len(best_form + 1L)]
+      statistics[[paste0("fit_", pred)]] <- list(
+        form = form_names[best_form],
+        degree = best_form,
+        coefficients = unname(stats::coef(best_model)[terms_of_form]),
+        predictor_range = range(x, na.rm = TRUE),
+        aic = c(linear = aic_lin, quadratic = aic_quad, cubic = aic_cubic)
+      )
+
       # Generate phase plot
       plots[[paste0("phase_", pred)]] <- plot_phase_1d(data, pred, target)
     }

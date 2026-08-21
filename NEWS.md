@@ -1,3 +1,29 @@
+# EmpiricalDynamics 0.1.10
+
+## `explore_dynamics()` fitted three forms and published only the winner's name
+
+For each predictor the function estimates a linear, a quadratic and a cubic
+model, compares them by AIC and picks one -- and then stored only the word
+(`nonlin_<pred>`) and the correlation, discarding the three fitted objects on
+the next iteration of the loop. A caller was therefore told *that* a relation
+is curved and never *how*, which is enough to describe a shape and not enough
+to ask anything of it. The question that motivated this is whether the fitted
+curve is monotone over the range that was actually observed: that is a
+different question from whether it is curved -- a quadratic can rise
+throughout its observed range or turn inside it -- and it cannot be answered
+from a name.
+
+The winning fit is now published under `fit_<pred>`, with `form`, `degree`,
+`coefficients` in ascending powers of the predictor, `predictor_range` and the
+three compared `aic` values. Nothing new is estimated: what changes is that
+what was already estimated is no longer thrown away. Coefficients are read out
+by term label rather than by position, so an aliased term arrives as `NA` in
+its own slot instead of shifting every power by one.
+
+The `@return` of the function also said `statistics` was a data frame. It is
+and always was a named list; the documentation now says so and enumerates the
+keys.
+
 # EmpiricalDynamics 0.1.9
 
 ## The lm path of `analyze_fixed_points()` ignored the fitted coefficients

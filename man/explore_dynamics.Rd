@@ -31,7 +31,12 @@ c("timeseries", "phase", "bivariate", "interactions").}
 A list containing:
 \itemize{
 \item suggestions: Character vector of suggested functional forms
-\item statistics: Data frame of diagnostic statistics
+\item statistics: A named \emph{list} of diagnostic statistics, not a data
+frame. Its entries are \code{target_mean}, \code{target_sd},
+\code{target_range}, \code{trend_correlation}, and then, for each
+predictor, \code{cor_<pred>} with the correlation, \code{nonlin_<pred>}
+with the name of the form the AIC preferred, \code{fit_<pred>} with that
+form itself, and \code{interaction_<a>_<b>} with the p-value of a pair.
 \item plots: List of ggplot objects (if available)
 }
 }
@@ -39,6 +44,22 @@ A list containing:
 Generates a battery of diagnostic plots to explore the dynamical structure
 of the data and suggests potential functional forms.
 }
+\section{The published fit}{
+ \code{fit_<pred>} carries the fit that won the
+AIC comparison, so that a caller can ask questions of the curve and not
+only of its name. It is a list with \code{form} (the same word as
+\code{nonlin_<pred>}), \code{degree} (1, 2 or 3), \code{coefficients},
+\code{predictor_range} and \code{aic} (all three compared values).
+
+\strong{The coefficients are in ascending powers of the predictor} and are
+\code{degree + 1} long, so that the fitted value at \code{x} is
+\code{sum(coefficients * x^(0:degree))}. An aliased term comes back as
+\code{NA} in its own slot rather than shifting the powers. The range is the
+observed range of the predictor, which is the interval over which anything
+asked of the fitted curve is a statement about the data rather than an
+extrapolation.
+}
+
 \examples{
 \donttest{
 # Toy example
