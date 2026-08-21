@@ -499,7 +499,13 @@ If you use EmpiricalDynamics in your research, please cite:
 
 ## 📜 License
 
-MIT License. See LICENSE for details.
+GPL (>= 3). See [LICENSE.md](LICENSE.md) for the full text.
+
+The package imports `gridExtra`, `lmtest`, `minpack.lm`, `signal` and `tseries`, all of
+them copyleft, so the combination a user installs is reached by the GPL whatever this
+file says. Declaring GPL (>= 3) is the only statement that stays true as the dependency
+set changes, and it removes a per-release audit that is exactly the kind that gets
+forgotten.
 
 ---
 

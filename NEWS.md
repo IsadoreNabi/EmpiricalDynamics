@@ -95,6 +95,22 @@ a number**:
 
 For a point estimate nothing about the returned shape changes.
 
+### The licence is now GPL (>= 3)
+
+It was `MIT + file LICENSE` while the package imports `gridExtra`, `lmtest`,
+`minpack.lm`, `signal` and `tseries` -- all copyleft. Nothing about that was
+unlawful, and CRAN does not police it, but it promised a permissiveness the
+installed combination does not have, and it made the consistency of the
+declaration something that had to be re-audited on every release against a
+dependency set that keeps moving. `GPL (>= 3)` is true whatever the
+dependencies do next.
+
+It also fixes the licence GitHub reports. `MIT + file LICENSE` obliges CRAN's
+two-line `LICENSE` stub, GitHub prefers that file over `LICENSE.md`, fails to
+recognise its text, and reports `NOASSERTION` no matter what `LICENSE.md`
+says. `GPL (>= 3)` is a standard licence and carries no stub, so `LICENSE.md`
+is the only licence file left and is detected. The stub has been deleted.
+
 ### Also
 
 The `"exogenous_values"` and `"coefficient_values"` attributes now travel with

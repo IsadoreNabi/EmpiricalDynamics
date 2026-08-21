@@ -14,7 +14,7 @@ Description: A comprehensive toolkit for discovering differential and difference
     industrial-grade robustness, physics-informed constraints, and rigorous
     out-of-sample validation. Designed for economists, physicists, and researchers
     studying dynamical systems from observational data.
-License: MIT + file LICENSE
+License: GPL (>= 3)
 Encoding: UTF-8
 Roxygen: list(markdown = TRUE)
 SystemRequirements: Julia (>= 1.6)
