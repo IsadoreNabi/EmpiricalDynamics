@@ -16,8 +16,10 @@ NULL
 #' @param predictors Character vector of predictor variable names.
 #' @param time Name of the time column (auto-detected if NULL).
 #' @param n_bins Number of bins for conditional analysis.
-#' @param include Which plots to include: "all", or subset of 
-#'   c("timeseries", "phase", "bivariate", "interactions").
+#' @param include Which blocks to run: \code{"all"}, or any subset of
+#'   \code{c("timeseries", "phase", "bivariate", "interactions")}. A name
+#'   outside that set is an error rather than a block that quietly does not
+#'   run.
 #'
 #' @return A list containing:
 #' \itemize{
@@ -30,6 +32,17 @@ NULL
 #'     form itself, and \code{interaction_<a>_<b>} with the p-value of a pair.
 #'   \item plots: List of ggplot objects (if available)
 #' }
+#'
+#' @section Interactions: Every pair of predictors that is tested is recorded
+#'   in \code{statistics} under \code{interaction_<a>_<b>}, whether or not it
+#'   came out significant, so that a pair which was tested and came out flat
+#'   can be told from a pair that was never tested. The threshold used to
+#'   announce a pair in \code{suggestions} is 0.05 and is fixed, and \strong{no
+#'   correction for multiplicity is applied}: with p predictors there are
+#'   p(p-1)/2 tests, so at six predictors the probability of at least one
+#'   spurious announcement under the null is about 0.54. The p-values are all
+#'   returned precisely so that a caller who needs a correction can apply the
+#'   one they can defend.
 #'
 #' @section The published fit: \code{fit_<pred>} carries the fit that won the
 #'   AIC comparison, so that a caller can ask questions of the curve and not
@@ -66,11 +79,25 @@ NULL
 #' @export
 explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
                              n_bins = 10, include = "all") {
-  
+
   # Validate inputs
   if (!target %in% names(data)) {
     stop("Target variable '", target, "' not found in data", call. = FALSE)
   }
+  # `include == "all" || "phase" %in% include` is an error, not a warning, from
+  # R 4.3 onward whenever `include` has more than one element -- which is the
+  # documented way to call this function: "'length = 2' in coercion to
+  # 'logical(1)'". A misspelling used to be worse than an error, because it
+  # silently skipped the block it was meant to select.
+  known <- c("all", "timeseries", "phase", "bivariate", "interactions")
+  if (!is.character(include) || !length(include) || any(is.na(include)) ||
+      !all(include %in% known)) {
+    stop("'include' must be \"all\" or a subset of ",
+         paste0("\"", setdiff(known, "all"), "\"", collapse = ", "),
+         "; got ", paste0("\"", include, "\"", collapse = ", "),
+         call. = FALSE)
+  }
+  wants <- function(what) any(include == "all") || what %in% include
   
   # Auto-detect predictors from variable specification
   if (is.null(predictors)) {
@@ -99,6 +126,12 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
     } else {
       time_candidates <- c("time", "t", "date", "year", "period")
       time <- intersect(time_candidates, names(data))[1]
+      # `[1]` on an empty intersect is NA_character_, not NULL, and the guard
+      # downstream tests is.null(). A ggplot was therefore built around
+      # .data[[NA_character_]], which ggplot2 does not evaluate until the plot
+      # is drawn: the function returned normally and the error surfaced later,
+      # far from its cause.
+      if (length(time) != 1L || is.na(time)) time <- NULL
     }
   }
   
@@ -114,7 +147,7 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
   y <- data[[target]]
   
   # 1. Time series plot
-  if (include == "all" || "timeseries" %in% include) {
+  if (wants("timeseries")) {
     message("1. Time Series Analysis")
     message("   ---------------------")
     
@@ -146,7 +179,7 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
   }
   
   # 2. Phase diagram (dZ vs Z) for each predictor
-  if (include == "all" || "phase" %in% include) {
+  if (wants("phase")) {
     message("2. Phase Diagrams")
     message("   ---------------")
     
@@ -213,7 +246,7 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
   }
   
   # 3. Bivariate relationships
-  if (include == "all" || "bivariate" %in% include) {
+  if (wants("bivariate")) {
     message("3. Bivariate Scatter Analysis")
     message("   ---------------------------")
     
@@ -224,8 +257,7 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
       
       # Detect saturation/asymptotic behavior
       x <- data[[pred]]
-      x_range <- max(x, na.rm = TRUE) - min(x, na.rm = TRUE)
-      
+
       # Check for logistic-type saturation
       # Group into tertiles and check if slope decreases
       breaks <- stats::quantile(x, probs = c(0, 1/3, 2/3, 1), na.rm = TRUE)
@@ -237,10 +269,19 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
         groups <- cut(x, breaks = breaks, include.lowest = TRUE, labels = FALSE)
       }
       
-      slopes <- numeric(3)
+      # A group that was not fitted has NO slope, and must not enter the
+      # monotonicity test below as a measured zero. Initialised with
+      # numeric(3) it entered as one: a tertile of five points or fewer, or of
+      # none at all, contributed an exact 0 that the guard could not see,
+      # because the guard tests for NA and only the rarer zero-variance case
+      # produces one. Measured on group sizes 48/8/1, the slopes entering the
+      # test were (2.7154, 2.3525, 0.0000) against the honest
+      # (2.7154, 2.3525, NA), and the function announced saturation where the
+      # honest computation says nothing at all.
+      slopes <- rep(NA_real_, 3)
       for (g in 1:3) {
         idx <- which(groups == g)
-        if (length(idx) > 5) {
+        if (length(idx) > 5 && stats::sd(x[idx], na.rm = TRUE) > 0) {
           slopes[g] <- stats::coef(stats::lm(y[idx] ~ x[idx]))[2]
         }
       }
@@ -261,7 +302,7 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
   }
   
   # 4. Interaction detection
-  if (include == "all" || "interactions" %in% include) {
+  if (wants("interactions")) {
     if (length(predictors) >= 2) {
       message("4. Interaction Detection")
       message("   ----------------------")
@@ -284,13 +325,19 @@ explore_dynamics <- function(data, target, predictors = NULL, time = NULL,
           anova_result <- stats::anova(lm_add, lm_int)
           p_interaction <- anova_result$`Pr(>F)`[2]
           
+          # Every pair that was tested is recorded, significant or not.
+          # Storing only the significant ones left a reader unable to tell a
+          # pair that was tested and came out flat from a pair that was never
+          # tested at all, and on additive data the statistics list came back
+          # entirely empty.
+          statistics[[paste0("interaction_", pred1, "_", pred2)]] <-
+            p_interaction
+
           if (!is.na(p_interaction) && p_interaction < 0.05) {
             message(sprintf("   Significant interaction: %s * %s (p = %.4f)",
                             pred1, pred2, p_interaction))
             suggestions <- c(suggestions,
                              sprintf("Interaction term %s * %s", pred1, pred2))
-            
-            statistics[[paste0("interaction_", pred1, "_", pred2)]] <- p_interaction
           }
         }
       }

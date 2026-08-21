@@ -1,3 +1,173 @@
+# EmpiricalDynamics 0.1.12
+
+Nine defects, found by auditing `cross_validate()` and `explore_dynamics()`
+against the failure the previous release repaired elsewhere: a well formed
+number that means something other than what it says. None of them changes any
+figure produced by the recovery scripts, which use `compute_derivative()` and
+`symbolic_search()` and call neither function.
+
+## `method = "rolling"` trained on the future and tested a tenth of the rows
+
+`create_rolling_folds()` computed an expanding training window and
+`cross_validate()` then discarded it, taking `setdiff(seq_len(n), test_idx)`
+instead -- everything outside the test block, future included. Measured at
+n = 50, k = 5, horizon = 1: fold 1 tested row 9 and trained on 41 rows that
+come after it, and 45 of the 50 rows were never held out by any fold. Walk-
+forward validation exists to prevent exactly that. Its windows could also run
+off the end of the data: `create_rolling_folds(50, 5, 20)` returned indices up
+to 89 on a series of 50 rows.
+
+Each method now states its own training rows instead of leaving the caller to
+assume they are the complement of the test rows, and the k test windows of
+`"rolling"` tile the tail of the series -- the part a forecast is judged on,
+and the only layout that cannot run past the last row. The training set is
+shaped by the new `window` argument: `"expanding"` uses every row before the
+test window, `"rolling"` a window of fixed length ending just before it.
+`"sliding"` is accepted as a synonym of `"rolling"`, because econometrics and
+machine learning give that one method two names and nobody should have to
+remember which one this package picked. `train_indices` travels with the
+result.
+
+`method = "block"` also left rows untested: it stepped by `floor(n / k)` from
+row 1 and truncated to k starts, so at n = 50, k = 3 the blocks were 1:16,
+17:32 and 33:48 and rows 49 and 50 were held out by nobody. The blocks now
+partition every row. A `block_size` inconsistent with `k` is refused with the
+arithmetic that refuses it, instead of silently returning a shorter list of
+folds that made the loop index past its end and die with "subscript out of
+bounds".
+
+## R-squared was measured against a benchmark that had seen the answers
+
+`ss_tot` was taken around the mean of the **test** fold. That benchmark can
+only be computed once the held-out values are known, so it is not available to
+any procedure being validated; it is a different quantity in every fold, which
+makes the average over folds an average of incommensurable things; and it is
+exactly zero when the test fold has one row, which is what `"rolling"` with
+the default horizon produces -- the per-fold R-squared came back `-Inf`, five
+times out of five.
+
+It is now taken around the mean of each fold's **training** rows: the constant
+a caller would have predicted without fitting anything, which is the standard
+out-of-sample benchmark and is defined for a single held-out row. Two exact
+identities follow, and both are now asserted: a model that predicts the
+training mean scores **0**, and a perfect model scores **1**. Under the old
+definition the first could not even be written, because the training-mean
+model's score was not determined.
+
+`r_squared_pooled` is added as a ratio of sums rather than a mean of ratios,
+since `E[A/B]` is not `E[A]/E[B]` and averaging per-fold R-squared is biased
+even when every term is right. `ss_res` and `ss_tot` travel per fold, so a
+nearly degenerate benchmark is visible instead of being rounded into or out of
+existence; the only undefined case is the exact one, `ss_tot == 0`, and it is
+an identity rather than a threshold.
+
+## A fold that failed to refit was dropped out of the average in silence
+
+`mean_rmse` and its three companions carried `na.rm = TRUE`, so a mean over
+the two folds that converged printed exactly like a mean over five, `$k` still
+said five, and nothing in the returned object recorded that three had failed.
+The run-time warning is gone by the time anyone reads the object.
+
+A fold failing is not a bookkeeping accident. An optimiser that does not
+converge on three training subsets out of five is reporting that the equation
+is fragile, and averaging over the folds where it did converge is conditioning
+on success -- selection on the outcome. So:
+
+- `mean_rmse`, `sd_rmse`, `mean_mae` and `mean_r_squared` are `NA` unless all
+  k folds produced a value. `NA` propagates, which is the point: it reaches
+  `validate_model()`'s report on its own.
+- `rmse_given_converged`, `mae_given_converged` and
+  `r_squared_given_converged` hold the conditional figures, next to
+  `prob_converged` and `n_folds_ok`, so that a conditional number is never
+  read without the fraction it was computed from.
+- `rmse_with_fallback` and `r_squared_pooled_with_fallback` hold the error of
+  the *procedure* rather than of the model: a fold whose refit failed is
+  scored with the prediction a caller would have been left with, the training
+  mean, which contributes exactly zero to the pooled R-squared. The failure is
+  penalised inside the metric instead of removed from it.
+- `failures` holds each failure's message, named by fold, and is empty when
+  every fold refitted.
+
+`print.cv_result()` says why the k-fold figures are `NA` before showing
+anything else, and never prints a conditional figure without its condition.
+
+## A glm was cross-validated as a gaussian lm
+
+`inherits(equation, "lm")` is `TRUE` for a `glm`, so a `glm` fell into the
+branch that refits with `stats::lm()`: family and link discarded without a
+word. Measured on a poisson fit over four folds, the reported RMSE was 2.9511,
+which is to four decimals what a gaussian `lm` refit gives; a genuine poisson
+refit gives 2.6111. This is the same class-inheritance blind spot that 0.1.11
+repaired in `analyze_fixed_points()`, in the other half of the same file.
+
+A `glm` is now refitted as a `glm`, with its family, and predicted on the
+response scale. A fit that carries posterior draws -- which also inherits from
+`glm` -- is refused with an `"ed_refit_substitutes_estimator"` condition
+rather than refitted by maximum likelihood under the label of the fit that was
+handed in, and the message points at `loo::loo()`, which reuses the draws that
+are already there.
+
+## Observation weights were validated, sliced per fold, and then dropped
+
+The `lm` branch called `stats::lm(form, data = train_data)` without them. The
+`nls` and symbolic branches passed them. Measured with weights of 1000 on five
+of sixty rows, the cross-validated RMSE was identical to the last decimal with
+and without. Both the `lm` and the `glm` paths now refit under each fold's own
+training weights.
+
+## `explore_dynamics()`
+
+**A tertile that was never fitted voted in the saturation test.** `slopes` was
+initialised with `numeric(3)`, so a group of five points or fewer -- or of
+none at all, which the equal-width fallback grouping can produce -- entered
+the monotonicity comparison with a slope of exactly `0`. The guard was
+`!any(is.na(slopes))`, which catches only the rarer zero-variance case.
+Measured on group sizes 48/8/1, the slopes entering the test were
+`(2.7154, 2.3525, 0.0000)` against the honest `(2.7154, 2.3525, NA)`, and the
+function announced "Possible saturation/logistic behavior" where the honest
+computation says nothing at all -- into `suggestions`, which is what a user
+reads to choose a functional form. An unfitted group is now `NA`.
+
+**`include` as a subset was a hard error.** The manual page documents
+`include` as `"all"` or a subset of four names; the code asked
+`include == "all" || "phase" %in% include`, and from R 4.3 onward `||` with an
+operand of length greater than one is an error: `'length = 2' in coercion to
+'logical(1)'`. The documented call has therefore not worked since R 4.3. A
+name outside the set is now an error too, where before a misspelling silently
+skipped the block it was meant to select.
+
+**With no time-like column a broken plot was handed back.** The auto-detection
+ends in `intersect(candidates, names(data))[1]`, which is `NA_character_` and
+not `NULL` when nothing matches, and the guard downstream tests `is.null()`. A
+ggplot was built around `.data[[NA_character_]]`; ggplot2 does not evaluate
+aesthetics until the plot is drawn, so the function returned normally and the
+error surfaced later, far from its cause.
+
+**Interaction pairs that were not significant left no trace.** The p-value was
+stored inside the significance test, so a pair that was tested and came out
+flat could not be told from a pair that was never tested, and on additive data
+`statistics` came back entirely empty. Every pair tested is now recorded. The
+0.05 threshold is documented as fixed and uncorrected for multiplicity -- with
+six predictors there are fifteen tests and the probability of at least one
+spurious announcement under the null is about 0.54 -- and the p-values are all
+returned so that a caller can apply the correction they can defend.
+
+Also: `x_range` was computed in the bivariate block and never read.
+
+## What the cross-validation figure does and does not mean
+
+Documented rather than papered over: when the response is a numerically
+estimated derivative, which is the usual case here, the folds are not
+independent of one another. `compute_derivative()` builds each `dZ[t]` from
+neighbouring rows -- a window for `"savgol"` and `"spline"`, the whole series
+for `"tvr"` -- so a held-out row's response is partly a function of training
+rows' predictors. This does not bias a comparison between candidate equations,
+which all receive the same favour, but the figure is not the error to expect
+on a fresh series, and least of all on a forecast, where the rows after `t`
+are not available to differentiate with. Recomputing the derivative inside
+each fold is what `refit_derivative` is reserved for, and it remains
+unimplemented.
+
 # EmpiricalDynamics 0.1.11
 
 ## A bifurcation sweep over an `rstanarm` fit returned the same fixed point at every parameter value

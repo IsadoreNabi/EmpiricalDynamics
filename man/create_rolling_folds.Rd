@@ -4,9 +4,37 @@
 \alias{create_rolling_folds}
 \title{Create Rolling Folds (walk-forward validation)}
 \usage{
-create_rolling_folds(n, k, horizon = 1)
+create_rolling_folds(
+  n,
+  k,
+  horizon = 1,
+  window = "expanding",
+  train_size = NULL
+)
+}
+\arguments{
+\item{window}{\code{"expanding"} trains on every row before the test window;
+\code{"rolling"} trains on a fixed-length window ending just before it.}
+
+\item{train_size}{Length of the training window when \code{window} is
+\code{"rolling"}. \code{NULL} takes the length of the first fold's
+expanding window, so every fold trains on as many rows as the first one
+has available rather than on a number chosen by hand.}
 }
 \description{
-Create Rolling Folds (walk-forward validation)
+Returns train and test indices together, because for walk-forward validation
+the training set is NOT everything outside the test window. The previous
+version returned test indices only and computed the training set upstream as
+\code{setdiff(seq_len(n), test_idx)}, which handed the model the whole
+future of the series -- 41 rows after the test point, in a measured n = 50,
+k = 5 run -- and so validated nothing that walk-forward validation exists to
+validate. Its test windows also began at \code{floor(n / (k + 1)) + 1} and
+advanced by \code{horizon}, which at n = 50, k = 5, horizon = 1 tested rows
+9 to 13 and left 45 rows untested, and at horizon = 20 produced indices up
+to 89 on a series of 50 rows.
+}
+\details{
+The k test windows now tile the tail of the series, which is both the part a
+forecast is judged on and the only layout that cannot run off the end.
 }
 \keyword{internal}

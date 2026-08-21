@@ -1,7 +1,7 @@
 Package: EmpiricalDynamics
 Title: Empirical Discovery of Differential Equations from Time Series
         Data
-Version: 0.1.11
+Version: 0.1.12
 Authors@R: 
     person("José Mauricio", "Gómez Julián", email = "isadore.nabi@pm.me", role = c("aut", "cre"),
            comment = c(ORCID = "0009-0000-2412-3150"))

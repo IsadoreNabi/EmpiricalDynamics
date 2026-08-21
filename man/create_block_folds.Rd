@@ -7,6 +7,10 @@
 create_block_folds(n, k, block_size = NULL)
 }
 \description{
-Create Block Folds (for time series)
+k contiguous blocks that partition every row. The previous construction
+stepped by \code{floor(n / k)} from row 1 and truncated to k starts, which
+left the remainder of the series untested without saying so: at n = 50 and
+k = 3 the blocks were 1:16, 17:32 and 33:48, and rows 49 and 50 were never
+held out by any fold. A k-fold partition has to cover the data it partitions.
 }
 \keyword{internal}

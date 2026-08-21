@@ -24,9 +24,25 @@ NULL
 #' @param response Name of the response column (derivative).
 #' @param derivative_col Alias for response (for compatibility).
 #' @param k Number of folds for cross-validation.
-#' @param method CV method: "random", "block", "rolling".
-#' @param block_size For block methods, size of contiguous blocks.
-#' @param horizon For rolling CV, forecast horizon.
+#' @param method CV method: \code{"random"}, \code{"block"} or
+#'   \code{"rolling"}. \code{"block"} partitions the rows into k contiguous
+#'   blocks and trains on everything outside the held-out block, both sides
+#'   included. \code{"rolling"} is walk-forward: it trains only on rows that
+#'   come BEFORE the test window, and its k test windows tile the tail of the
+#'   series.
+#' @param block_size For \code{"block"}, the size of the contiguous blocks. It
+#'   must be consistent with \code{k}; a size that implies a different number
+#'   of blocks is an error rather than a silently shorter list of folds.
+#' @param horizon For \code{"rolling"}, the number of rows in each test window.
+#' @param window For \code{"rolling"}, the shape of the training set:
+#'   \code{"expanding"} uses every row before the test window, so the training
+#'   set grows fold by fold; \code{"rolling"} uses a window of fixed length
+#'   ending just before it. \code{"sliding"} is accepted as a synonym of
+#'   \code{"rolling"} -- the two words name the same thing in different
+#'   literatures. Ignored by the other methods.
+#' @param train_size Length of the training window when \code{window} is
+#'   \code{"rolling"}. \code{NULL} takes the length of the first fold's
+#'   expanding window.
 #' @param refit_derivative Logical; whether to recompute derivatives for each fold (currently unused).
 #' @param diff_method Differentiation method if refitting (currently unused).
 #' @param weights Optional vector of observation weights, one per row of
@@ -67,6 +83,53 @@ NULL
 #'   \item{stalled_folds}{Folds in which the Julia optimiser did not move off
 #'     its starting constants, so the error reported for them is that of the
 #'     equation as the search left it. Empty for the R engine.}
+#'   \item{train_indices}{The rows each fold trained on. Only for
+#'     \code{"random"} and \code{"block"} is this everything outside the test
+#'     block; for \code{"rolling"} it is the past alone.}
+#'   \item{n_folds_ok, prob_converged, failures}{How many folds refitted, what
+#'     fraction that is, and the error message of each one that did not, named
+#'     by fold. \code{failures} is empty when every fold refitted.}
+#'   \item{rmse_given_converged, mae_given_converged,
+#'     r_squared_given_converged}{The same errors over the folds that refitted.
+#'     Read them together with \code{prob_converged}: they are conditional on
+#'     the refit having succeeded, which is selection on the outcome.}
+#'   \item{r_squared_pooled}{A ratio of sums rather than a mean of ratios.}
+#'   \item{rmse_with_fallback, r_squared_pooled_with_fallback}{The error of the
+#'     procedure rather than of the model: a fold whose refit failed is scored
+#'     with the prediction a caller would have been left with, the training
+#'     mean, which contributes exactly zero to the pooled R-squared.}
+#'   \item{ss_res, ss_tot}{Per fold, so that a nearly degenerate benchmark is
+#'     visible instead of being rounded into or out of existence.}
+#'
+#' @section What the figures mean:
+#'
+#'   \strong{R-squared is against the mean of each fold's TRAINING rows}, which
+#'   is the constant a caller would have predicted without fitting anything and
+#'   the only one available before the held-out rows are seen. Using the test
+#'   fold's own mean, as this function did before, benchmarks the model against
+#'   a constant that can only be computed after the answers are in; makes every
+#'   fold a different quantity, so averaging them means nothing; and is exactly
+#'   zero for a single-row test fold, which is what \code{"rolling"} with the
+#'   default horizon produces and which returned \code{-Inf}. Under the present
+#'   definition a model that predicts the training mean scores exactly 0 and a
+#'   perfect model exactly 1.
+#'
+#'   \strong{The k-fold figures are \code{NA} unless all k folds refitted.}
+#'   Averaging over the folds that converged is conditioning on success. The
+#'   conditional figures are there under their own names.
+#'
+#'   \strong{The folds are not independent of one another when the response is
+#'   a numerically estimated derivative}, which is the usual case in this
+#'   package. \code{\link{compute_derivative}} builds each \code{dZ[t]} from
+#'   neighbouring rows -- a window for \code{"savgol"} and \code{"spline"},
+#'   the whole series for \code{"tvr"} -- so a held-out row's response is
+#'   partly a function of training rows' predictors. This does not bias a
+#'   comparison between candidate equations, which all receive the same favour,
+#'   but it does mean the figure is not the error to expect on a fresh series,
+#'   and least of all on a forecast, where the rows after \code{t} are not
+#'   available to differentiate with. Recomputing the derivative inside each
+#'   fold is what \code{refit_derivative} is reserved for, and it is not
+#'   implemented.
 #'
 #' @examples
 #' \donttest{
@@ -95,6 +158,8 @@ cross_validate <- function(equation, data, response = NULL,
                            method = c("block", "random", "rolling"),
                            block_size = NULL,
                            horizon = 1,
+                           window = c("expanding", "rolling", "sliding"),
+                           train_size = NULL,
                            refit_derivative = FALSE,
                            diff_method = "tvr",
                            weights = NULL,
@@ -111,6 +176,12 @@ cross_validate <- function(equation, data, response = NULL,
 
   method <- match.arg(method)
   refit_engine <- match.arg(refit_engine)
+  # "rolling" and "sliding" name the same thing -- a training window of fixed
+  # length that moves with the test window. Econometrics says the first, machine
+  # learning says the second, and nobody should have to remember which one this
+  # package picked.
+  window <- match.arg(window)
+  if (identical(window, "sliding")) window <- "rolling"
   equation <- as_symbolic_equation(equation)
   n <- nrow(data)
 
@@ -124,12 +195,13 @@ cross_validate <- function(equation, data, response = NULL,
     }
   }
   
-  # Generate fold indices
-  fold_indices <- switch(method,
-                         "random" = create_random_folds(n, k),
-                         "block" = create_block_folds(n, k, block_size),
-                         "rolling" = create_rolling_folds(n, k, horizon)
-  )
+  # Fold indices, with each method stating its own training rows.
+  folds <- ed_cv_folds(method, n, k, block_size = block_size,
+                       horizon = horizon, window = window,
+                       train_size = train_size)
+  fold_indices <- folds$test
+  train_indices <- folds$train
+  k <- length(fold_indices)
   
   # Extract formula from equation
   if (inherits(equation, "symbolic_equation")) {
@@ -145,11 +217,30 @@ cross_validate <- function(equation, data, response = NULL,
   } else if (inherits(equation, "nls")) {
     form <- stats::formula(equation)
     eq_type <- "nls"
+  } else if (inherits(equation, "glm")) {
+    # A glm inherits from lm, so it used to fall into the branch below and be
+    # refitted with stats::lm(): gaussian, identity link, family discarded.
+    # Measured on a poisson fit, the number reported was to four decimals the
+    # number a gaussian lm gives, and not the one a poisson refit gives.
+    if (!is.null(ed_draws_of(equation))) {
+      ed_stop("ed_refit_substitutes_estimator", paste0(
+        "this ", paste(class(equation), collapse = "/"), " object carries ",
+        "posterior draws, so refitting it per fold with stats::glm() would ",
+        "report the cross-validated error of a maximum likelihood fit under ",
+        "the label of the fit that was handed in: a different estimator, ",
+        "silently substituted. For a posterior fit use approximate ",
+        "leave-one-out cross-validation (loo::loo()), which reuses the draws ",
+        "that are already there"))
+    }
+    form <- stats::formula(equation)
+    eq_family <- stats::family(equation)
+    eq_type <- "glm"
   } else if (inherits(equation, "lm")) {
     form <- stats::formula(equation)
     eq_type <- "lm"
   } else {
-    stop("Unknown equation type. Expected symbolic_equation, nls, or lm object.")
+    stop("Unknown equation type. Expected symbolic_equation, nls, lm or glm ",
+         "object.")
   }
   
   # How the equation will be re-estimated, decided once rather than per fold.
@@ -167,12 +258,20 @@ cross_validate <- function(equation, data, response = NULL,
 
   # Storage for results
   results <- list(
-    rmse = numeric(k),
-    mae = numeric(k),
-    r_squared = numeric(k),
+    rmse = rep(NA_real_, k),
+    mae = rep(NA_real_, k),
+    r_squared = rep(NA_real_, k),
+    ss_res = rep(NA_real_, k),
+    ss_tot = rep(NA_real_, k),
     predictions = vector("list", k),
-    fold_indices = fold_indices
+    fold_indices = fold_indices,
+    train_indices = train_indices
   )
+  # The error a fold would have incurred had the refit failed and the naive
+  # benchmark been used instead. Computed for every fold, used only where the
+  # refit did fail.
+  rmse_naive <- rep(NA_real_, k)
+  failures <- character(0)
 
   # Folds where the Julia optimiser did not move off its starting point.
   stalled <- integer(0)
@@ -181,7 +280,7 @@ cross_validate <- function(equation, data, response = NULL,
     if (verbose) message("Fold ", i, "/", k)
 
     test_idx <- fold_indices[[i]]
-    train_idx <- setdiff(seq_len(n), test_idx)
+    train_idx <- train_indices[[i]]
 
     train_data <- data[train_idx, , drop = FALSE]
     test_data <- data[test_idx, , drop = FALSE]
@@ -189,8 +288,20 @@ cross_validate <- function(equation, data, response = NULL,
 
     # Refit on training data and predict on the held-out rows
     pred <- tryCatch({
-      if (eq_type == "lm") {
-        stats::predict(stats::lm(form, data = train_data), newdata = test_data)
+      if (eq_type == "lm" || eq_type == "glm") {
+        # The weights were validated on entry and sliced per fold, and then
+        # this branch dropped them: a declaration that bound nothing. Measured
+        # before the repair, weights of 1000 on five rows left the RMSE
+        # identical to the last decimal.
+        args <- list(formula = form, data = train_data)
+        if (!is.null(train_weights)) args$weights <- train_weights
+        if (eq_type == "glm") {
+          args$family <- eq_family
+          stats::predict(do.call(stats::glm, args), newdata = test_data,
+                         type = "response")
+        } else {
+          stats::predict(do.call(stats::lm, args), newdata = test_data)
+        }
 
       } else if (eq_type == "nls") {
         if (!requireNamespace("minpack.lm", quietly = TRUE)) {
@@ -232,28 +343,40 @@ cross_validate <- function(equation, data, response = NULL,
       }
     }, error = function(e) {
       warning("Fold ", i, " fitting failed: ", conditionMessage(e))
-      NULL
+      structure(conditionMessage(e), class = "ed_fold_failure")
     })
 
-    if (is.null(pred)) {
-      results$rmse[i] <- NA
-      results$mae[i] <- NA
-      results$r_squared[i] <- NA
+    actual <- test_data[[response]]
+    # The benchmark: the constant a caller would have predicted without
+    # fitting anything, and the only one available before seeing the test
+    # rows. The test fold's OWN mean was used here before, which is a
+    # benchmark that can only be computed after the answers are in, is a
+    # different quantity in every fold so the folds cannot be averaged, and
+    # is exactly zero for a single-row fold -- which is what "rolling" with
+    # its default horizon produces, and which returned -Inf.
+    y_bar <- mean(train_data[[response]], na.rm = TRUE)
+    ss_tot <- sum((actual - y_bar)^2, na.rm = TRUE)
+    results$ss_tot[i] <- ss_tot
+    rmse_naive[i] <- sqrt(mean((actual - y_bar)^2, na.rm = TRUE))
+
+    if (inherits(pred, "ed_fold_failure")) {
+      failures[[as.character(i)]] <- as.character(pred)
       next
     }
 
     pred <- as.numeric(pred)
-    actual <- test_data[[response]]
-
-    # Calculate metrics
     residuals <- actual - pred
     results$rmse[i] <- sqrt(mean(residuals^2, na.rm = TRUE))
     results$mae[i] <- mean(abs(residuals), na.rm = TRUE)
-    
+
     ss_res <- sum(residuals^2, na.rm = TRUE)
-    ss_tot <- sum((actual - mean(actual, na.rm = TRUE))^2, na.rm = TRUE)
-    results$r_squared[i] <- 1 - ss_res / ss_tot
-    
+    results$ss_res[i] <- ss_res
+    # Undefined only when every held-out value equals the training mean
+    # exactly. That is an identity, not a threshold: no cutoff is chosen and
+    # ss_tot travels with the result so a nearly degenerate fold is visible
+    # rather than rounded into or out of existence.
+    results$r_squared[i] <- if (ss_tot > 0) 1 - ss_res / ss_tot else NA_real_
+
     results$predictions[[i]] <- data.frame(
       index = test_idx,
       actual = actual,
@@ -262,12 +385,65 @@ cross_validate <- function(equation, data, response = NULL,
     )
   }
   
-  # Summary statistics
-  results$mean_rmse <- mean(results$rmse, na.rm = TRUE)
-  results$sd_rmse <- stats::sd(results$rmse, na.rm = TRUE)
-  results$mean_mae <- mean(results$mae, na.rm = TRUE)
-  results$mean_r_squared <- mean(results$r_squared, na.rm = TRUE)
+  # Summary statistics.
+  #
+  # `na.rm = TRUE` used to sit on all four of these, so a mean over the two
+  # folds that converged printed exactly like a mean over five, and nothing in
+  # the returned object recorded that three had failed. A fold failing is not a
+  # bookkeeping accident: an optimiser that does not converge on three
+  # training subsets out of five is telling you the equation is fragile, and
+  # averaging over the folds where it did converge is conditioning on success.
+  # So the quantity that was asked for -- the k-fold error -- is NA unless k
+  # folds produced one, and NA propagates through everything downstream.
+  # The conditional quantity is available under a name that carries its own
+  # condition, next to the fraction it was computed from.
+  ok <- !is.na(results$rmse)
+  results$n_folds_ok <- sum(ok)
+  results$prob_converged <- sum(ok) / k
+  results$failures <- failures
+
+  results$mean_rmse <- mean(results$rmse)
+  results$sd_rmse <- stats::sd(results$rmse)
+  results$mean_mae <- mean(results$mae)
+  results$mean_r_squared <- mean(results$r_squared)
+
+  results$rmse_given_converged <- if (any(ok)) mean(results$rmse[ok]) else NA_real_
+  results$mae_given_converged <- if (any(ok)) mean(results$mae[ok]) else NA_real_
+  results$r_squared_given_converged <- if (any(ok)) {
+    mean(results$r_squared[ok], na.rm = TRUE)
+  } else {
+    NA_real_
+  }
+
+  # A ratio of sums rather than a mean of ratios: E[A/B] is not E[A]/E[B], so
+  # averaging per-fold R^2 is biased even when every term is right. This one
+  # also survives a fold whose benchmark is degenerate.
+  denom <- sum(results$ss_tot[ok], na.rm = TRUE)
+  results$r_squared_pooled <- if (isTRUE(denom > 0)) {
+    1 - sum(results$ss_res[ok], na.rm = TRUE) / denom
+  } else {
+    NA_real_
+  }
+
+  # The error of the PROCEDURE rather than of the model: a fold whose refit
+  # failed is scored with the prediction a caller would actually have been left
+  # with, the training mean. Under the benchmark above such a fold contributes
+  # ss_res = ss_tot exactly, so its R^2 contribution is exactly zero -- the
+  # failure is penalised inside the metric instead of being removed from it.
+  rmse_fb <- results$rmse
+  rmse_fb[!ok] <- rmse_naive[!ok]
+  results$rmse_with_fallback <- mean(rmse_fb)
+  ss_res_fb <- results$ss_res
+  ss_res_fb[!ok] <- results$ss_tot[!ok]
+  denom_all <- sum(results$ss_tot, na.rm = TRUE)
+  results$r_squared_pooled_with_fallback <- if (isTRUE(denom_all > 0)) {
+    1 - sum(ss_res_fb, na.rm = TRUE) / denom_all
+  } else {
+    NA_real_
+  }
+
   results$method <- method
+  results$window <- if (identical(method, "rolling")) window else NA_character_
   results$k <- k
   results$refitted <- !identical(plan$kind, "fixed")
   results$parameterization <- if (identical(plan$kind, "discovered")) {
@@ -378,35 +554,117 @@ create_random_folds <- function(n, k) {
 }
 
 #' Create Block Folds (for time series)
+#'
+#' k contiguous blocks that partition every row. The previous construction
+#' stepped by \code{floor(n / k)} from row 1 and truncated to k starts, which
+#' left the remainder of the series untested without saying so: at n = 50 and
+#' k = 3 the blocks were 1:16, 17:32 and 33:48, and rows 49 and 50 were never
+#' held out by any fold. A k-fold partition has to cover the data it partitions.
+#'
 #' @keywords internal
 create_block_folds <- function(n, k, block_size = NULL) {
   if (is.null(block_size)) {
-    block_size <- floor(n / k)
+    return(unname(split(seq_len(n), cut(seq_len(n), k, labels = FALSE))))
   }
-  
-  # Create contiguous blocks
+  if (!is.numeric(block_size) || length(block_size) != 1L ||
+      !is.finite(block_size) || block_size < 1) {
+    stop("'block_size' must be a single positive number of rows",
+         call. = FALSE)
+  }
+  implied <- as.integer(ceiling(n / block_size))
+  if (!identical(implied, as.integer(k))) {
+    # Silently returning fewer blocks than k left the caller's loop indexing
+    # past the end of the list: "subscript out of bounds", from a function
+    # that was handed two arguments that cannot both be honoured.
+    stop("'block_size' = ", block_size, " over ", n, " rows makes ", implied,
+         " contiguous blocks, but 'k' asks for ", k,
+         ": one of the two has to give (k = ", implied,
+         " matches this block size)", call. = FALSE)
+  }
   starts <- seq(1, n, by = block_size)
-  if (length(starts) > k) starts <- starts[1:k]
-  
   lapply(seq_along(starts), function(i) {
-    start <- starts[i]
-    end <- min(start + block_size - 1, n)
-    start:end
+    starts[i]:min(starts[i] + block_size - 1, n)
   })
 }
 
 #' Create Rolling Folds (walk-forward validation)
+#'
+#' Returns train and test indices together, because for walk-forward validation
+#' the training set is NOT everything outside the test window. The previous
+#' version returned test indices only and computed the training set upstream as
+#' \code{setdiff(seq_len(n), test_idx)}, which handed the model the whole
+#' future of the series -- 41 rows after the test point, in a measured n = 50,
+#' k = 5 run -- and so validated nothing that walk-forward validation exists to
+#' validate. Its test windows also began at \code{floor(n / (k + 1)) + 1} and
+#' advanced by \code{horizon}, which at n = 50, k = 5, horizon = 1 tested rows
+#' 9 to 13 and left 45 rows untested, and at horizon = 20 produced indices up
+#' to 89 on a series of 50 rows.
+#'
+#' The k test windows now tile the tail of the series, which is both the part a
+#' forecast is judged on and the only layout that cannot run off the end.
+#'
+#' @param window \code{"expanding"} trains on every row before the test window;
+#'   \code{"rolling"} trains on a fixed-length window ending just before it.
+#' @param train_size Length of the training window when \code{window} is
+#'   \code{"rolling"}. \code{NULL} takes the length of the first fold's
+#'   expanding window, so every fold trains on as many rows as the first one
+#'   has available rather than on a number chosen by hand.
 #' @keywords internal
-create_rolling_folds <- function(n, k, horizon = 1) {
-  # Expanding window with fixed test horizon
-  min_train <- floor(n / (k + 1))
-  
-  lapply(1:k, function(i) {
-    train_end <- min_train + (i - 1) * horizon
-    test_start <- train_end + 1
-    test_end <- min(test_start + horizon - 1, n)
-    test_start:test_end
+create_rolling_folds <- function(n, k, horizon = 1, window = "expanding",
+                                 train_size = NULL) {
+  if (!is.numeric(horizon) || length(horizon) != 1L || !is.finite(horizon) ||
+      horizon < 1) {
+    stop("'horizon' must be a single positive number of rows", call. = FALSE)
+  }
+  horizon <- as.integer(horizon)
+  first_train <- n - k * horizon
+  if (first_train < 2L) {
+    stop("k = ", k, " test windows of horizon ", horizon, " take up ",
+         k * horizon, " of the ", n, " rows, leaving ", max(0L, first_train),
+         " to train the first fold on: lower 'k' or 'horizon'", call. = FALSE)
+  }
+  if (is.null(train_size)) {
+    train_size <- first_train
+  } else if (!is.numeric(train_size) || length(train_size) != 1L ||
+             !is.finite(train_size) || train_size < 2) {
+    stop("'train_size' must be a single number of rows, at least 2",
+         call. = FALSE)
+  }
+  train_size <- as.integer(train_size)
+
+  lapply(seq_len(k), function(i) {
+    test_start <- n - (k - i + 1L) * horizon + 1L
+    test_end <- test_start + horizon - 1L
+    train_end <- test_start - 1L
+    train_start <- if (identical(window, "rolling")) {
+      max(1L, train_end - train_size + 1L)
+    } else {
+      1L
+    }
+    list(train = train_start:train_end, test = test_start:test_end)
   })
+}
+
+#' Fold indices for every method, as train/test pairs
+#'
+#' The three methods disagree about what the training set is, and only one of
+#' them can say "everything that is not the test set". Making each method state
+#' its own training rows is what keeps that disagreement from being resolved
+#' silently by the caller.
+#'
+#' @keywords internal
+ed_cv_folds <- function(method, n, k, block_size = NULL, horizon = 1,
+                        window = "expanding", train_size = NULL) {
+  if (identical(method, "rolling")) {
+    pairs <- create_rolling_folds(n, k, horizon, window, train_size)
+    return(list(test = lapply(pairs, `[[`, "test"),
+                train = lapply(pairs, `[[`, "train")))
+  }
+  test <- switch(method,
+                 "random" = create_random_folds(n, k),
+                 "block" = create_block_folds(n, k, block_size))
+  list(test = test,
+       train = lapply(test, function(te) setdiff(seq_len(n), te)))
 }
 
 #' Print CV Results
@@ -419,7 +677,11 @@ create_rolling_folds <- function(n, k, horizon = 1) {
 print.cv_result <- function(x, ...) {
   cat("Cross-Validation Results\n")
   cat("========================\n")
-  cat("Method:", x$method, "with", x$k, "folds\n")
+  cat("Method:", x$method, "with", x$k, "folds")
+  if (!is.null(x$window) && !is.na(x$window)) {
+    cat(", ", x$window, " training window", sep = "")
+  }
+  cat("\n")
   if (!is.null(x$refitted)) {
     if (isTRUE(x$refitted)) {
       cat("Refitted per fold with the", x$refit_engine, "engine")
@@ -432,10 +694,32 @@ print.cv_result <- function(x, ...) {
     }
   }
   cat("\n")
-  cat("RMSE:     ", sprintf("%.4f (SD: %.4f)", x$mean_rmse, x$sd_rmse), "\n")
-  cat("MAE:      ", sprintf("%.4f", x$mean_mae), "\n")
-  cat("R-squared:", sprintf("%.4f", x$mean_r_squared), "\n\n")
+  n_ok <- if (is.null(x$n_folds_ok)) x$k else x$n_folds_ok
+  if (n_ok < x$k) {
+    # The headline figures are NA here, and saying why must come before them:
+    # a reader who sees NA without the reason will suspect the software.
+    cat(sprintf("%d of %d folds did not refit, so the k-fold figures are not defined.\n",
+                x$k - n_ok, x$k))
+    cat(sprintf("  first failure, fold %s: %s\n",
+                names(x$failures)[1], x$failures[[1]]))
+    cat("\n")
+    cat("Given the", n_ok, "folds that refitted",
+        sprintf("(%.0f%% of them):\n", 100 * x$prob_converged))
+    cat("  RMSE:     ", sprintf("%.4f", x$rmse_given_converged), "\n")
+    cat("  MAE:      ", sprintf("%.4f", x$mae_given_converged), "\n")
+    cat("  R-squared:", sprintf("%.4f (pooled)", x$r_squared_pooled), "\n\n")
+    cat("Counting the failures at the naive benchmark:\n")
+    cat("  RMSE:     ", sprintf("%.4f", x$rmse_with_fallback), "\n")
+    cat("  R-squared:",
+        sprintf("%.4f (pooled)", x$r_squared_pooled_with_fallback), "\n\n")
+  } else {
+    cat("RMSE:     ", sprintf("%.4f (SD: %.4f)", x$mean_rmse, x$sd_rmse), "\n")
+    cat("MAE:      ", sprintf("%.4f", x$mean_mae), "\n")
+    cat("R-squared:", sprintf("%.4f (mean over folds), %.4f (pooled)",
+                              x$mean_r_squared, x$r_squared_pooled), "\n\n")
+  }
   cat("Per-fold RMSE:", paste(sprintf("%.4f", x$rmse), collapse = ", "), "\n")
+  cat("R-squared is against the mean of each fold's TRAINING rows.\n")
   invisible(x)
 }
 

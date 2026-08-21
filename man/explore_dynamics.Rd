@@ -24,8 +24,10 @@ explore_dynamics(
 
 \item{n_bins}{Number of bins for conditional analysis.}
 
-\item{include}{Which plots to include: "all", or subset of
-c("timeseries", "phase", "bivariate", "interactions").}
+\item{include}{Which blocks to run: \code{"all"}, or any subset of
+\code{c("timeseries", "phase", "bivariate", "interactions")}. A name
+outside that set is an error rather than a block that quietly does not
+run.}
 }
 \value{
 A list containing:
@@ -44,6 +46,19 @@ form itself, and \code{interaction_<a>_<b>} with the p-value of a pair.
 Generates a battery of diagnostic plots to explore the dynamical structure
 of the data and suggests potential functional forms.
 }
+\section{Interactions}{
+ Every pair of predictors that is tested is recorded
+in \code{statistics} under \code{interaction_<a>_<b>}, whether or not it
+came out significant, so that a pair which was tested and came out flat
+can be told from a pair that was never tested. The threshold used to
+announce a pair in \code{suggestions} is 0.05 and is fixed, and \strong{no
+correction for multiplicity is applied}: with p predictors there are
+p(p-1)/2 tests, so at six predictors the probability of at least one
+spurious announcement under the null is about 0.54. The p-values are all
+returned precisely so that a caller who needs a correction can apply the
+one they can defend.
+}
+
 \section{The published fit}{
  \code{fit_<pred>} carries the fit that won the
 AIC comparison, so that a caller can ask questions of the curve and not

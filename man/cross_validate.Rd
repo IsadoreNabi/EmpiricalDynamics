@@ -13,6 +13,8 @@ cross_validate(
   method = c("block", "random", "rolling"),
   block_size = NULL,
   horizon = 1,
+  window = c("expanding", "rolling", "sliding"),
+  train_size = NULL,
   refit_derivative = FALSE,
   diff_method = "tvr",
   weights = NULL,
@@ -32,11 +34,29 @@ cross_validate(
 
 \item{k}{Number of folds for cross-validation.}
 
-\item{method}{CV method: "random", "block", "rolling".}
+\item{method}{CV method: \code{"random"}, \code{"block"} or
+\code{"rolling"}. \code{"block"} partitions the rows into k contiguous
+blocks and trains on everything outside the held-out block, both sides
+included. \code{"rolling"} is walk-forward: it trains only on rows that
+come BEFORE the test window, and its k test windows tile the tail of the
+series.}
 
-\item{block_size}{For block methods, size of contiguous blocks.}
+\item{block_size}{For \code{"block"}, the size of the contiguous blocks. It
+must be consistent with \code{k}; a size that implies a different number
+of blocks is an error rather than a silently shorter list of folds.}
 
-\item{horizon}{For rolling CV, forecast horizon.}
+\item{horizon}{For \code{"rolling"}, the number of rows in each test window.}
+
+\item{window}{For \code{"rolling"}, the shape of the training set:
+\code{"expanding"} uses every row before the test window, so the training
+set grows fold by fold; \code{"rolling"} uses a window of fixed length
+ending just before it. \code{"sliding"} is accepted as a synonym of
+\code{"rolling"} -- the two words name the same thing in different
+literatures. Ignored by the other methods.}
+
+\item{train_size}{Length of the training window when \code{window} is
+\code{"rolling"}. \code{NULL} takes the length of the first fold's
+expanding window.}
 
 \item{refit_derivative}{Logical; whether to recompute derivatives for each fold (currently unused).}
 
@@ -72,6 +92,23 @@ the equation was a discovered one, and \code{NULL} otherwise}
 \item{stalled_folds}{Folds in which the Julia optimiser did not move off
 its starting constants, so the error reported for them is that of the
 equation as the search left it. Empty for the R engine.}
+\item{train_indices}{The rows each fold trained on. Only for
+\code{"random"} and \code{"block"} is this everything outside the test
+block; for \code{"rolling"} it is the past alone.}
+\item{n_folds_ok, prob_converged, failures}{How many folds refitted, what
+fraction that is, and the error message of each one that did not, named
+by fold. \code{failures} is empty when every fold refitted.}
+\item{rmse_given_converged, mae_given_converged,
+r_squared_given_converged}{The same errors over the folds that refitted.
+Read them together with \code{prob_converged}: they are conditional on
+the refit having succeeded, which is selection on the outcome.}
+\item{r_squared_pooled}{A ratio of sums rather than a mean of ratios.}
+\item{rmse_with_fallback, r_squared_pooled_with_fallback}{The error of the
+procedure rather than of the model: a fold whose refit failed is scored
+with the prediction a caller would have been left with, the training
+mean, which contributes exactly zero to the pooled R-squared.}
+\item{ss_res, ss_tot}{Per fold, so that a nearly degenerate benchmark is
+visible instead of being rounded into or out of existence.}
 }
 \description{
 Performs k-fold or block cross-validation to assess out-of-sample predictive
@@ -89,6 +126,38 @@ coefficients. An equation with no constants at all is not refitted -- there
 is nothing to refit -- and is scored by evaluating it on the held-out rows;
 the returned object says so in \code{refitted}.
 }
+\section{What the figures mean}{
+
+
+\strong{R-squared is against the mean of each fold's TRAINING rows}, which
+is the constant a caller would have predicted without fitting anything and
+the only one available before the held-out rows are seen. Using the test
+fold's own mean, as this function did before, benchmarks the model against
+a constant that can only be computed after the answers are in; makes every
+fold a different quantity, so averaging them means nothing; and is exactly
+zero for a single-row test fold, which is what \code{"rolling"} with the
+default horizon produces and which returned \code{-Inf}. Under the present
+definition a model that predicts the training mean scores exactly 0 and a
+perfect model exactly 1.
+
+\strong{The k-fold figures are \code{NA} unless all k folds refitted.}
+Averaging over the folds that converged is conditioning on success. The
+conditional figures are there under their own names.
+
+\strong{The folds are not independent of one another when the response is
+a numerically estimated derivative}, which is the usual case in this
+package. \code{\link{compute_derivative}} builds each \code{dZ[t]} from
+neighbouring rows -- a window for \code{"savgol"} and \code{"spline"},
+the whole series for \code{"tvr"} -- so a held-out row's response is
+partly a function of training rows' predictors. This does not bias a
+comparison between candidate equations, which all receive the same favour,
+but it does mean the figure is not the error to expect on a fresh series,
+and least of all on a forecast, where the rows after \code{t} are not
+available to differentiate with. Recomputing the derivative inside each
+fold is what \code{refit_derivative} is reserved for, and it is not
+implemented.
+}
+
 \examples{
 \donttest{
 # Toy example using lm
